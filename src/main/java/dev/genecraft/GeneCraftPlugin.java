@@ -1,12 +1,20 @@
 package dev.genecraft;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
+import org.bukkit.block.BlockFace;
+import org.bukkit.util.Vector;
+import org.bukkit.block.Block;
+import org.bukkit.block.Container;
+import org.bukkit.block.data.Bisected;
+import org.bukkit.block.data.type.Door;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -30,6 +38,7 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import io.papermc.paper.event.player.AsyncChatEvent;
 import org.bukkit.projectiles.ProjectileSource;
 import org.bukkit.persistence.PersistentDataType;
 import com.destroystokyo.paper.profile.PlayerProfile;
@@ -42,6 +51,7 @@ import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.event.HoverEvent;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -53,6 +63,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -78,6 +90,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
     private NamespacedKey agentFormKey;
     private HttpClient http;
     private final Set<UUID> pendingPlans = ConcurrentHashMap.newKeySet();
+    private final Set<UUID> invalidatedPlans = ConcurrentHashMap.newKeySet();
     private final Map<UUID, BukkitTask> followTasks = new ConcurrentHashMap<>();
     private final Map<UUID, Set<String>> pendingInboxSnapshots = new ConcurrentHashMap<>();
     private int guardPulse = 0;
@@ -100,6 +113,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         Bukkit.getPluginManager().registerEvents(this, this);
         Bukkit.getScheduler().runTaskTimer(this, this::tickBodyguards, 10L, 10L);
         Bukkit.getScheduler().runTaskTimer(this, this::tickAutonomousAgents, 20L, 20L);
+        Bukkit.getScheduler().runTaskTimer(this, this::tickJobs, 20L, 10L);
         Bukkit.getScheduler().runTask(this, this::relabelExistingAgents);
         getLogger().info("GeneCraft ready. Use /genecraft help to start.");
     }
@@ -137,6 +151,12 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         }
         if (subcommand.equals("autonomy")) {
             return autonomy(sender, args);
+        }
+        if (subcommand.equals("job")) {
+            return jobCommand(sender, args);
+        }
+        if (subcommand.equals("supplies")) {
+            return supplies(sender);
         }
         if (subcommand.equals("inbox")) {
             return inbox(sender, args);
@@ -423,6 +443,41 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
     public void onPlayerJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         Bukkit.getScheduler().runTask(this, () -> relabelAgentsInWorld(player.getWorld()));
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onAddressedAgentChat(AsyncChatEvent event) {
+        String message = PlainTextComponentSerializer.plainText().serialize(event.message()).trim();
+        if (!message.startsWith("@")) return;
+        int split = message.indexOf(' ');
+        if (split < 2 || split == message.length() - 1) return;
+        String targetName = message.substring(1, split).replaceAll("[:,]$", "");
+        if (!isAgentName(targetName)) return;
+        String prompt = message.substring(split + 1).trim();
+        if (prompt.isBlank()) return;
+        event.setCancelled(true);
+        UUID playerId = event.getPlayer().getUniqueId();
+        Bukkit.getScheduler().runTask(this, () -> {
+            Player player = Bukkit.getPlayer(playerId);
+            if (player == null || !player.isOnline()) return;
+            Mob agent = findAgent(player, targetName);
+            if (agent == null) {
+                player.sendMessage("§d[GeneCraft] §fI can't find your agent '" + clean(targetName, 24) + "' nearby.");
+                return;
+            }
+            if (isDirectCancel(prompt)) {
+                invalidatePendingPlan(agent);
+                cancelFollow(agent.getUniqueId());
+                if (activeJob(agent)) cancelJob(player, agent, true);
+                else {
+                    agent.getPathfinder().stopPathfinding();
+                    agentSay(player, agentName(agent), "Stopped. I don’t have an active work order now.");
+                }
+                return;
+            }
+            player.sendMessage(Component.text("You → " + agentName(agent) + ": " + clean(prompt, 240), NamedTextColor.GRAY));
+            requestPlan(player, agent, prompt, false);
+        });
     }
 
     private boolean bodyguardEnabled(UUID ownerId) {
@@ -795,6 +850,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         String name = agentName(agent);
         UUID agentId = agent.getUniqueId();
         if (!pendingPlans.add(agentId)) {
+            if (!autonomous) player.sendMessage("§d[GeneCraft] §f" + name + " is finishing the last reply first — try your message again in a moment.");
             return;
         }
         if (!autonomous) player.sendMessage("§b[GeneCraft] §fThinking about that request…");
@@ -810,6 +866,10 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         bridgeRequest("POST", "/agent/plan", body).whenComplete((response, error) -> Bukkit.getScheduler().runTask(this, () -> {
             pendingPlans.remove(agentId);
             Set<String> capturedInbox = pendingInboxSnapshots.remove(agentId);
+            if (invalidatedPlans.remove(agentId)) {
+                if (player.isOnline() && !autonomous) player.sendMessage("§d[GeneCraft] §fStopped. I discarded the unfinished reply.");
+                return;
+            }
             if (!player.isOnline() || (autonomous && !getConfig().getBoolean(statePath(agent) + ".autonomy.enabled", false))) return;
             if (error != null) {
                 if (!autonomous) player.sendMessage("§c[GeneCraft] §f" + friendlyBridgeError(error));
@@ -844,11 +904,742 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         if (agent == null) {
             player.sendMessage("§d[GeneCraft] §fI can't find that agent nearby.");
         } else {
+            invalidatePendingPlan(agent);
             cancelFollow(agent.getUniqueId());
+            cancelJob(player, agent, true);
             agent.getPathfinder().stopPathfinding();
             player.sendMessage("§d[GeneCraft] §f" + agentName(agent) + " stopped.");
         }
         return true;
+    }
+
+    private boolean jobCommand(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("Run this command in the game as a player.");
+            return true;
+        }
+        if (args.length < 3) {
+            player.sendMessage("Use /genecraft job <agent> status or cancel");
+            return true;
+        }
+        Mob agent = findAgent(player, args[1]);
+        if (agent == null) {
+            player.sendMessage("§d[GeneCraft] §fI can't find that agent nearby.");
+            return true;
+        }
+        if (args[2].equalsIgnoreCase("cancel")) {
+            invalidatePendingPlan(agent);
+            cancelJob(player, agent, true);
+            return true;
+        }
+        if (!args[2].equalsIgnoreCase("status")) {
+            player.sendMessage("Use /genecraft job " + agentName(agent) + " status or cancel");
+            return true;
+        }
+        String path = jobPath(agent);
+        String kind = getConfig().getString(path + ".kind", "");
+        String status = getConfig().getString(path + ".status", "");
+        if (kind.isBlank() || status.isBlank()) {
+            player.sendMessage("§d[GeneCraft] §f" + agentName(agent) + " has no saved work order.");
+            return true;
+        }
+        int progress = getConfig().getInt(path + ".progress", 0);
+        int target = getConfig().getInt(path + ".target", getConfig().getInt(path + ".length", 0));
+        player.sendMessage("§d[GeneCraft] §f" + agentName(agent) + ": " + kind.replace('_', ' ')
+                + " — " + status.replace('_', ' ') + (target > 0 ? " (" + progress + "/" + target + ")" : ""));
+        return true;
+    }
+
+    private boolean supplies(CommandSender sender) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("Run this command in the game as a player.");
+            return true;
+        }
+        var section = getConfig().getConfigurationSection(ownerSupplyPath(player.getUniqueId()));
+        if (section == null || section.getKeys(false).isEmpty()) {
+            player.sendMessage("§d[GeneCraft] §fYour shared agent supplies are empty. Ask an agent to gather wood or mine.");
+            return true;
+        }
+        List<String> counts = section.getKeys(false).stream().sorted()
+                .map(material -> material.toLowerCase(Locale.ROOT) + " × " + section.getInt(material))
+                .toList();
+        player.sendMessage("§d[GeneCraft] §fShared GeneCraft supplies: " + String.join(", ", counts));
+        return true;
+    }
+
+    private String jobPath(Mob agent) {
+        return statePath(agent) + ".job";
+    }
+
+    private String ownerSupplyPath(UUID ownerId) {
+        return "owners." + ownerId + ".supplies";
+    }
+
+    private boolean activeJob(Mob agent) {
+        String status = getConfig().getString(jobPath(agent) + ".status", "");
+        return status.equals("running") || status.startsWith("waiting_");
+    }
+
+    private boolean canStartJob(Player player, Mob agent) {
+        if (activeJob(agent)) {
+            player.sendMessage("§d[GeneCraft] §f" + agentName(agent) + " already has a work order. Say @" + agentName(agent)
+                    + " stop, or use /genecraft job " + agentName(agent) + " cancel.");
+            return false;
+        }
+        long running = ownedAgents(player).stream().filter(this::activeJob).count();
+        if (running >= 3) {
+            player.sendMessage("§d[GeneCraft] §fYou already have three active work orders. Finish or cancel one first.");
+            return false;
+        }
+        if (!agent.getWorld().equals(player.getWorld()) || agent.getLocation().distance(player.getLocation()) > PLAYER_ACTION_LIMIT) {
+            player.sendMessage("§d[GeneCraft] §fBring the agent within " + (int) PLAYER_ACTION_LIMIT + " blocks to give it a work order.");
+            return false;
+        }
+        return true;
+    }
+
+    private void startGatherWood(Player player, Mob agent, int targetLogs) {
+        if (!canStartJob(player, agent)) return;
+        cancelFollow(agent.getUniqueId());
+        agent.getPathfinder().stopPathfinding();
+        Map<String, Object> job = new java.util.LinkedHashMap<>();
+        job.put("kind", "gather_wood");
+        job.put("status", "running");
+        job.put("world", agent.getWorld().getName());
+        job.put("anchor_x", agent.getLocation().getBlockX());
+        job.put("anchor_y", agent.getLocation().getBlockY());
+        job.put("anchor_z", agent.getLocation().getBlockZ());
+        job.put("target", targetLogs);
+        job.put("progress", 0);
+        job.put("created_at", System.currentTimeMillis());
+        getConfig().set(jobPath(agent), job);
+        saveConfig();
+        agentSay(player, agentName(agent), "On it. I’ll collect up to " + targetLogs
+                + " nearby logs and add the planks to our shared supplies. Stay within 32 blocks so I can keep working.");
+    }
+
+    private void startStripMine(Player player, Mob agent, int length, int yLevel) {
+        if (!canStartJob(player, agent)) return;
+        if (agent.getLocation().getBlockY() != yLevel || player.getLocation().getBlockY() != yLevel) {
+            agentSay(player, agentName(agent), "I can do that, but bring both of us to foot-level Y=" + yLevel
+                    + " first. I won’t excavate a remote tunnel through the world.");
+            return;
+        }
+        cancelFollow(agent.getUniqueId());
+        agent.getPathfinder().stopPathfinding();
+        Vector direction = player.getLocation().getDirection();
+        int dx = Math.abs(direction.getX()) > Math.abs(direction.getZ())
+                ? (direction.getX() >= 0 ? 1 : -1) : 0;
+        int dz = dx == 0 ? (direction.getZ() >= 0 ? 1 : -1) : 0;
+        int startX = agent.getLocation().getBlockX() + dx;
+        int startZ = agent.getLocation().getBlockZ() + dz;
+        Map<String, Object> job = new java.util.LinkedHashMap<>();
+        job.put("kind", "strip_mine");
+        job.put("status", "running");
+        job.put("world", agent.getWorld().getName());
+        job.put("start_x", startX);
+        job.put("start_y", yLevel);
+        job.put("start_z", startZ);
+        job.put("anchor_x", startX);
+        job.put("anchor_y", yLevel);
+        job.put("anchor_z", startZ);
+        job.put("direction_x", dx);
+        job.put("direction_z", dz);
+        job.put("length", length);
+        job.put("progress", 0);
+        job.put("created_at", System.currentTimeMillis());
+        getConfig().set(jobPath(agent), job);
+        saveConfig();
+        agentSay(player, agentName(agent), "I’ll cut a 1-wide, 2-high tunnel at Y=" + yLevel + " for " + length
+                + " blocks, following the direction you’re facing. I’ll stop at lava, water, or protected blocks.");
+    }
+
+    private void startHouseBuild(Player player, Mob agent, JsonArray blueprint, JsonArray sources) {
+        if (!canStartJob(player, agent)) return;
+        cancelFollow(agent.getUniqueId());
+        agent.getPathfinder().stopPathfinding();
+        World world = agent.getWorld();
+        Vector look = player.getLocation().getDirection();
+        int fx = Math.abs(look.getX()) > Math.abs(look.getZ()) ? (look.getX() >= 0 ? 1 : -1) : 0;
+        int fz = fx == 0 ? (look.getZ() >= 0 ? 1 : -1) : 0;
+        int rx = -fz;
+        int rz = fx;
+        int centerX = player.getLocation().getBlockX() + fx * 4;
+        int centerZ = player.getLocation().getBlockZ() + fz * 4;
+        BlockFace doorFacing = fx > 0 ? BlockFace.WEST : fx < 0 ? BlockFace.EAST
+                : fz > 0 ? BlockFace.NORTH : BlockFace.SOUTH;
+        int originX = centerX - rx * 2;
+        int originZ = centerZ - rz * 2;
+        int minSurface = Integer.MAX_VALUE;
+        int maxSurface = Integer.MIN_VALUE;
+        for (int x = 0; x <= 5; x++) {
+            for (int z = 0; z <= 5; z++) {
+                int surfaceX = originX + rx * x + fx * z;
+                int surfaceZ = originZ + rz * x + fz * z;
+                if (!world.isChunkLoaded(surfaceX >> 4, surfaceZ >> 4)) {
+                    agentSay(player, agentName(agent), "The house site reaches an unloaded chunk. Move closer and try again.");
+                    return;
+                }
+                int surface = groundSurfaceY(world, surfaceX, surfaceZ);
+                minSurface = Math.min(minSurface, surface);
+                maxSurface = Math.max(maxSurface, surface);
+            }
+        }
+        if (maxSurface - minSurface > 1) {
+            agentSay(player, agentName(agent), "That house site is too uneven. Find a flatter clearing and give me the order again.");
+            return;
+        }
+        int baseY = maxSurface + 1;
+        List<Map<String, Object>> placedBlocks = new ArrayList<>();
+        Set<String> used = new HashSet<>();
+        int doors = 0;
+        for (JsonElement element : blueprint) {
+            JsonObject item = element.getAsJsonObject();
+            int x = item.get("x").getAsInt();
+            int y = item.get("y").getAsInt();
+            int z = item.get("z").getAsInt();
+            String materialName = item.get("material").getAsString();
+            Material material = Material.matchMaterial(materialName);
+            if (!validBlueprintBlock(x, y, z, material) || !used.add(x + "," + y + "," + z)) {
+                agentSay(player, agentName(agent), "The house plan had a block or coordinate I can’t safely place, so I rejected the plan.");
+                return;
+            }
+            if (isWoodenDoor(material)) {
+                if (y >= 6 || used.contains(x + "," + (y + 1) + "," + z)) {
+                    agentSay(player, agentName(agent), "That door doesn’t fit the house plan, so I rejected the blueprint.");
+                    return;
+                }
+                doors++;
+            }
+            int blockX = originX + rx * x + fx * z;
+            int blockZ = originZ + rz * x + fz * z;
+            if (baseY + y < world.getMinHeight() || baseY + y >= world.getMaxHeight()
+                    || (material == Material.OAK_DOOR && baseY + y + 1 >= world.getMaxHeight())) {
+                agentSay(player, agentName(agent), "That house plan would cross the world-height boundary, so I rejected it.");
+                return;
+            }
+            Block block = world.getBlockAt(blockX, baseY + y, blockZ);
+            if (!block.getType().isAir()) {
+                agentSay(player, agentName(agent), "That house footprint isn’t clear. Move to an open, fairly flat spot and ask me again.");
+                return;
+            }
+            if (isWoodenDoor(material) && !world.getBlockAt(blockX, baseY + y + 1, blockZ).getType().isAir()) {
+                agentSay(player, agentName(agent), "The doorway is blocked. I won’t overwrite anything in the build area.");
+                return;
+            }
+            Map<String, Object> cell = new java.util.LinkedHashMap<>();
+            cell.put("x", blockX);
+            cell.put("y", baseY + y);
+            cell.put("z", blockZ);
+            cell.put("material", material.name());
+            placedBlocks.add(cell);
+        }
+        Set<String> worldPositions = new HashSet<>();
+        for (Map<String, Object> cell : placedBlocks) {
+            worldPositions.add(cell.get("x") + "," + cell.get("y") + "," + cell.get("z"));
+        }
+        for (Map<String, Object> cell : placedBlocks) {
+            Material doorMaterial = Material.matchMaterial(String.valueOf(cell.get("material")));
+            if (isWoodenDoor(doorMaterial)
+                    && worldPositions.contains(cell.get("x") + "," + (((Number) cell.get("y")).intValue() + 1) + "," + cell.get("z"))) {
+                agentSay(player, agentName(agent), "The house plan overlaps its door. I rejected it before changing the world.");
+                return;
+            }
+        }
+        if (placedBlocks.size() + doors > 120 || !isCoherentHouseBlueprint(blueprint)) {
+            agentSay(player, agentName(agent), "That plan needs a complete floor, walls, and roof within the build limit. I rejected it before changing the world.");
+            return;
+        }
+        Map<String, Object> job = new java.util.LinkedHashMap<>();
+        job.put("kind", "build_house");
+        job.put("status", "waiting_for_materials");
+        job.put("world", world.getName());
+        job.put("anchor_x", centerX);
+        job.put("anchor_y", baseY);
+        job.put("anchor_z", centerZ);
+        job.put("worker_x", centerX - fx + 0.5);
+        job.put("worker_y", baseY);
+        job.put("worker_z", centerZ - fz + 0.5);
+        job.put("door_facing", doorFacing.name());
+        job.put("blocks", placedBlocks);
+        job.put("progress", 0);
+        job.put("created_at", System.currentTimeMillis());
+        if (sources != null && !sources.isEmpty()) {
+            List<Map<String, Object>> sourceList = new ArrayList<>();
+            for (JsonElement element : sources) {
+                if (!element.isJsonObject()) continue;
+                JsonObject source = element.getAsJsonObject();
+                String url = source.has("url") ? source.get("url").getAsString() : "";
+                String title = source.has("title") ? clean(source.get("title").getAsString(), 100) : "Tutorial source";
+                if (url.startsWith("https://") && url.length() <= 500) sourceList.add(Map.of("url", url, "title", title));
+            }
+            job.put("sources", sourceList);
+        }
+        getConfig().set(jobPath(agent), job);
+        saveConfig();
+        agentSay(player, agentName(agent), "I’ve made a " + placedBlocks.size()
+                + "-block starter-house plan. I’ll build it when our shared supplies contain the materials it needs.");
+    }
+
+    private boolean validBlueprintBlock(int x, int y, int z, Material material) {
+        if (x < 0 || x > 5 || y < 0 || y > 6 || z < 0 || z > 5 || material == null) return false;
+        return (material.name().endsWith("_PLANKS") && material.isBlock())
+                || isWoodenDoor(material)
+                || Set.of(Material.COBBLESTONE, Material.COBBLED_DEEPSLATE, Material.GRANITE,
+                Material.DIORITE, Material.ANDESITE, Material.TUFF).contains(material);
+    }
+
+    private int groundSurfaceY(World world, int x, int z) {
+        for (int y = world.getMaxHeight() - 1; y >= world.getMinHeight(); y--) {
+            Material material = world.getBlockAt(x, y, z).getType();
+            String name = material.name();
+            if (!material.isSolid() || isTreeLog(material) || name.endsWith("_LEAVES") || name.equals("VINE")) continue;
+            return y + 1;
+        }
+        return world.getMinHeight();
+    }
+
+    private boolean isWoodenDoor(Material material) {
+        if (material == null || !material.name().endsWith("_DOOR") || !material.isBlock()) return false;
+        String wood = material.name().substring(0, material.name().length() - "_DOOR".length());
+        return Set.of("OAK", "SPRUCE", "BIRCH", "JUNGLE", "ACACIA", "DARK_OAK", "MANGROVE",
+                "CHERRY", "BAMBOO", "CRIMSON", "WARPED", "PALE_OAK").contains(wood);
+    }
+
+    private Material planksForDoor(Material door) {
+        if (!isWoodenDoor(door)) return null;
+        return Material.matchMaterial(door.name().substring(0, door.name().length() - "_DOOR".length()) + "_PLANKS");
+    }
+
+    private boolean isCoherentHouseBlueprint(JsonArray blueprint) {
+        int maxX = 0;
+        int maxZ = 0;
+        int maxY = 0;
+        int floorBlocks = 0;
+        Map<Integer, Integer> layerCounts = new HashMap<>();
+        for (JsonElement element : blueprint) {
+            JsonObject item = element.getAsJsonObject();
+            int x = item.get("x").getAsInt();
+            int y = item.get("y").getAsInt();
+            int z = item.get("z").getAsInt();
+            maxX = Math.max(maxX, x);
+            maxZ = Math.max(maxZ, z);
+            maxY = Math.max(maxY, y);
+            if (y == 0) floorBlocks++;
+            layerCounts.merge(y, 1, Integer::sum);
+        }
+        if (maxX < 3 || maxZ < 3 || maxY < 3 || floorBlocks < 12 || layerCounts.getOrDefault(maxY, 0) < 10) return false;
+        for (int y = 1; y < maxY; y++) {
+            if (layerCounts.getOrDefault(y, 0) < 6) return false;
+        }
+        return true;
+    }
+
+    private void sendSourceLinks(Player player, JsonArray sources) {
+        if (sources == null) return;
+        for (JsonElement element : sources) {
+            if (!element.isJsonObject()) continue;
+            JsonObject source = element.getAsJsonObject();
+            if (!source.has("url") || !source.has("title")) continue;
+            String url = source.get("url").getAsString();
+            if (!url.startsWith("https://") || url.length() > 500) continue;
+            String title = clean(source.get("title").getAsString(), 100);
+            player.sendMessage(Component.text("[GeneCraft house reference] " + title, NamedTextColor.AQUA)
+                    .clickEvent(ClickEvent.openUrl(url))
+                    .hoverEvent(HoverEvent.showText(Component.text("Open the tutorial used for the design"))));
+        }
+    }
+
+    private void cancelJob(Player player, Mob agent, boolean refund) {
+        String path = jobPath(agent);
+        if (!activeJob(agent)) {
+            if (player != null) player.sendMessage("§d[GeneCraft] §f" + agentName(agent) + " has no active work order.");
+            return;
+        }
+        if (refund) refundUnbuiltHouse(agent);
+        getConfig().set(path + ".status", "cancelled");
+        saveConfig();
+        agent.getPathfinder().stopPathfinding();
+        if (player != null) agentSay(player, agentName(agent), "Work order cancelled. I’ve stopped safely.");
+    }
+
+    private boolean isDirectCancel(String prompt) {
+        return prompt.trim().toLowerCase(Locale.ROOT).matches(
+                "(?:stop|stop it|stop moving|stop work|stop working|stop the work|stop the job|stop this job|"
+                        + "cancel|cancel it|cancel that|cancel the job|cancel this job|cancel work|cancel the work|abort)(?:[.!?]+)?");
+    }
+
+    private void invalidatePendingPlan(Mob agent) {
+        if (pendingPlans.contains(agent.getUniqueId())) invalidatedPlans.add(agent.getUniqueId());
+    }
+
+    private void refundUnbuiltHouse(Mob agent) {
+        String path = jobPath(agent);
+        if (!getConfig().getBoolean(path + ".materials_reserved", false)) return;
+        List<Map<?, ?>> blocks = getConfig().getMapList(path + ".blocks");
+        int progress = getConfig().getInt(path + ".progress", 0);
+        String owner = agent.getPersistentDataContainer().get(agentOwnerKey, PersistentDataType.STRING);
+        if (owner == null) return;
+        UUID ownerId;
+        try {
+            ownerId = UUID.fromString(owner);
+        } catch (IllegalArgumentException exception) {
+            return;
+        }
+        for (int index = progress; index < blocks.size(); index++) {
+            Object raw = blocks.get(index).get("material");
+            if (raw instanceof String materialName) {
+                Material material = Material.matchMaterial(materialName);
+                if (isWoodenDoor(material)) adjustSupply(ownerId, planksForDoor(material), 6);
+                else if (material != null) adjustSupply(ownerId, material, 1);
+            }
+        }
+        getConfig().set(path + ".materials_reserved", false);
+        saveConfig();
+    }
+
+    private void tickJobs() {
+        for (Player owner : Bukkit.getOnlinePlayers()) {
+            for (Mob agent : ownedAgents(owner)) {
+                if (!activeJob(agent)) continue;
+                if (!agent.getWorld().equals(owner.getWorld())
+                        || agent.getLocation().distance(owner.getLocation()) > PLAYER_ACTION_LIMIT) continue;
+                String kind = getConfig().getString(jobPath(agent) + ".kind", "");
+                switch (kind) {
+                    case "gather_wood" -> tickGatherWood(owner, agent);
+                    case "strip_mine" -> tickStripMine(owner, agent);
+                    case "build_house" -> tickHouseBuild(owner, agent);
+                    default -> finishJob(owner, agent, "failed", "I found an unknown work order and stopped it safely.");
+                }
+            }
+        }
+    }
+
+    private void tickGatherWood(Player owner, Mob agent) {
+        String path = jobPath(agent);
+        int target = getConfig().getInt(path + ".target", 0);
+        int gathered = getConfig().getInt(path + ".progress", 0);
+        if (target < 1 || target > 64) {
+            finishJob(owner, agent, "failed", "That wood target is outside my work limit, so I stopped.");
+            return;
+        }
+        if (gathered >= target) {
+            finishJob(owner, agent, "completed", "Wood-gathering job complete. I added " + gathered + " logs’ worth of planks to our shared supplies.");
+            return;
+        }
+        String worldName = getConfig().getString(path + ".world", "");
+        World world = Bukkit.getWorld(worldName);
+        if (world == null || !world.equals(agent.getWorld())) return;
+        int ax = getConfig().getInt(path + ".anchor_x");
+        int ay = getConfig().getInt(path + ".anchor_y");
+        int az = getConfig().getInt(path + ".anchor_z");
+        int targetX = getConfig().getInt(path + ".target_x", Integer.MIN_VALUE);
+        int targetY = getConfig().getInt(path + ".target_y", Integer.MIN_VALUE);
+        int targetZ = getConfig().getInt(path + ".target_z", Integer.MIN_VALUE);
+        Block log = null;
+        if (targetX != Integer.MIN_VALUE && world.isChunkLoaded(targetX >> 4, targetZ >> 4)) {
+            Block existing = world.getBlockAt(targetX, targetY, targetZ);
+            if (isTreeLog(existing.getType())) log = existing;
+        }
+        if (log == null) {
+            log = findNearbyLog(world, agent, ax, ay, az);
+            if (log == null) {
+                changeJobStatus(owner, agent, "waiting_for_logs", "I can’t see another tree within my 12-block work area. Bring me to a wooded spot or cancel this job.");
+                return;
+            }
+            getConfig().set(path + ".target_x", log.getX());
+            getConfig().set(path + ".target_y", log.getY());
+            getConfig().set(path + ".target_z", log.getZ());
+            saveConfig();
+            changeJobStatus(owner, agent, "running", "I found another tree. I’m continuing the wood run.");
+        }
+        Location approach = findLogApproach(agent, log, ay);
+        if (approach == null) {
+            getConfig().set(path + ".target_x", null);
+            getConfig().set(path + ".target_y", null);
+            getConfig().set(path + ".target_z", null);
+            saveConfig();
+            return;
+        }
+        if (agent.getLocation().distance(approach) > 2.8) {
+            agent.getPathfinder().moveTo(approach, 1.0);
+            return;
+        }
+        Material plank = planksForLog(log.getType());
+        if (plank == null) {
+            getConfig().set(path + ".target_x", null);
+            getConfig().set(path + ".target_y", null);
+            getConfig().set(path + ".target_z", null);
+            saveConfig();
+            return;
+        }
+        Location soundAt = log.getLocation();
+        log.setType(Material.AIR, false);
+        world.playSound(soundAt, org.bukkit.Sound.BLOCK_WOOD_BREAK, 0.8f, 1.0f);
+        adjustSupply(owner.getUniqueId(), plank, 4);
+        getConfig().set(path + ".progress", gathered + 1);
+        getConfig().set(path + ".target_x", null);
+        getConfig().set(path + ".target_y", null);
+        getConfig().set(path + ".target_z", null);
+        saveConfig();
+        if ((gathered + 1) % 4 == 0) {
+            agentSay(owner, agentName(agent), "I’ve collected " + (gathered + 1) + " logs so far.");
+        }
+    }
+
+    private Block findNearbyLog(World world, Mob agent, int anchorX, int anchorY, int anchorZ) {
+        Block best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int x = anchorX - 12; x <= anchorX + 12; x++) {
+            for (int z = anchorZ - 12; z <= anchorZ + 12; z++) {
+                if (!world.isChunkLoaded(x >> 4, z >> 4)) continue;
+                for (int y = Math.max(world.getMinHeight(), anchorY - 10); y <= Math.min(world.getMaxHeight() - 1, anchorY + 14); y++) {
+                    Block block = world.getBlockAt(x, y, z);
+                    if (!isTreeLog(block.getType())) continue;
+                    double distance = block.getLocation().distanceSquared(agent.getLocation());
+                    if (distance < bestDistance) {
+                        best = block;
+                        bestDistance = distance;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private Location findLogApproach(Mob agent, Block log, int anchorY) {
+        World world = log.getWorld();
+        int[][] offsets = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        Location best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int[] offset : offsets) {
+            int x = log.getX() + offset[0];
+            int z = log.getZ() + offset[1];
+            if (!world.isChunkLoaded(x >> 4, z >> 4)) continue;
+            for (int y = Math.max(world.getMinHeight() + 1, anchorY - 3); y <= Math.min(world.getMaxHeight() - 2, anchorY + 5); y++) {
+                Block feet = world.getBlockAt(x, y, z);
+                Block head = world.getBlockAt(x, y + 1, z);
+                Block floor = world.getBlockAt(x, y - 1, z);
+                if (!feet.isPassable() || !head.isPassable() || floor.isPassable() || floor.isLiquid()) continue;
+                Location candidate = new Location(world, x + 0.5, y, z + 0.5);
+                double distance = candidate.distanceSquared(agent.getLocation());
+                if (distance < bestDistance) {
+                    best = candidate;
+                    bestDistance = distance;
+                }
+            }
+        }
+        return best;
+    }
+
+    private boolean isTreeLog(Material material) {
+        String name = material.name();
+        return name.endsWith("_LOG") || name.endsWith("_WOOD") || name.endsWith("_STEM")
+                || name.endsWith("_HYPHAE") || name.equals("BAMBOO_BLOCK");
+    }
+
+    private Material planksForLog(Material log) {
+        String name = log.name();
+        String root = name;
+        for (String suffix : List.of("_LOG", "_WOOD", "_STEM", "_HYPHAE")) {
+            if (name.endsWith(suffix)) {
+                root = name.substring(0, name.length() - suffix.length());
+                break;
+            }
+        }
+        if (name.equals("BAMBOO_BLOCK")) root = "BAMBOO";
+        Material planks = Material.matchMaterial(root + "_PLANKS");
+        return planks != null ? planks : Material.OAK_PLANKS;
+    }
+
+    private void tickStripMine(Player owner, Mob agent) {
+        String path = jobPath(agent);
+        int length = getConfig().getInt(path + ".length", 0);
+        int progress = getConfig().getInt(path + ".progress", 0);
+        if (length < 4 || length > 32) {
+            finishJob(owner, agent, "failed", "That tunnel length is outside my work limit, so I stopped.");
+            return;
+        }
+        if (progress >= length) {
+            finishJob(owner, agent, "completed", "Strip mine complete. I stopped at the requested length.");
+            return;
+        }
+        World world = Bukkit.getWorld(getConfig().getString(path + ".world", ""));
+        if (world == null || !world.equals(agent.getWorld())) return;
+        int y = getConfig().getInt(path + ".start_y");
+        int dx = getConfig().getInt(path + ".direction_x");
+        int dz = getConfig().getInt(path + ".direction_z");
+        int x = getConfig().getInt(path + ".start_x") + dx * progress;
+        int z = getConfig().getInt(path + ".start_z") + dz * progress;
+        if (Math.abs(x - getConfig().getInt(path + ".anchor_x")) > 32
+                || Math.abs(z - getConfig().getInt(path + ".anchor_z")) > 32
+                || y < world.getMinHeight() || y + 1 >= world.getMaxHeight()) {
+            finishJob(owner, agent, "failed", "That tunnel would leave the protected work area, so I stopped.");
+            return;
+        }
+        if (!world.isChunkLoaded(x >> 4, z >> 4)) {
+            finishJob(owner, agent, "stopped_safe", "The tunnel reached an unloaded area. I stopped without loading new chunks.");
+            return;
+        }
+        Block lower = world.getBlockAt(x, y, z);
+        Block upper = world.getBlockAt(x, y + 1, z);
+        if (!isSafeTunnelSlice(lower, world, x, y, z) || !isSafeTunnelSlice(upper, world, x, y + 1, z)) {
+            finishJob(owner, agent, "stopped_safe", "I reached lava, water, or a protected block, so I stopped this tunnel safely.");
+            return;
+        }
+        for (Block block : List.of(lower, upper)) {
+            if (block.getType().isAir()) continue;
+            Material mined = block.getType();
+            block.setType(Material.AIR, false);
+            Material supply = mined.equals(Material.STONE) ? Material.COBBLESTONE
+                    : mined.equals(Material.DEEPSLATE) ? Material.COBBLED_DEEPSLATE : mined;
+            adjustSupply(owner.getUniqueId(), supply, 1);
+            world.playSound(block.getLocation(), org.bukkit.Sound.BLOCK_STONE_BREAK, 0.65f, 0.85f);
+        }
+        getConfig().set(path + ".progress", progress + 1);
+        saveConfig();
+        Location step = new Location(world, x + 0.5, y, z + 0.5, agent.getLocation().getYaw(), agent.getLocation().getPitch());
+        agent.teleport(step);
+        if ((progress + 1) % 8 == 0) agentSay(owner, agentName(agent), "I’ve cleared " + (progress + 1) + " of " + length + " tunnel blocks.");
+    }
+
+    private boolean isSafeTunnelSlice(Block block, World world, int x, int y, int z) {
+        Material material = block.getType();
+        if (material.isAir()) return true;
+        if (block.isLiquid() || material == Material.BEDROCK || material == Material.BARRIER
+                || material == Material.END_PORTAL || material == Material.END_PORTAL_FRAME
+                || material == Material.NETHER_PORTAL || material == Material.STRUCTURE_VOID
+                || material == Material.COMMAND_BLOCK || material == Material.CHAIN_COMMAND_BLOCK
+                || material == Material.REPEATING_COMMAND_BLOCK || block.getState() instanceof Container) return false;
+        String name = material.name();
+        boolean natural = Set.of("STONE", "DEEPSLATE", "COBBLED_DEEPSLATE", "TUFF", "CALCITE", "DRIPSTONE_BLOCK",
+                "GRANITE", "DIORITE", "ANDESITE", "DIRT", "ROOTED_DIRT", "GRAVEL", "SAND", "RED_SAND", "CLAY",
+                "NETHERRACK", "BLACKSTONE", "BASALT", "SOUL_SAND", "SOUL_SOIL", "COBBLESTONE").contains(name)
+                || name.endsWith("_ORE") || name.equals("ANCIENT_DEBRIS");
+        if (!natural) return false;
+        int[][] sides = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int[] side : sides) {
+            if (!world.isChunkLoaded((x + side[0]) >> 4, (z + side[1]) >> 4)) continue;
+            Material neighbor = world.getBlockAt(x + side[0], y, z + side[1]).getType();
+            if (neighbor == Material.LAVA || neighbor == Material.WATER) return false;
+        }
+        return true;
+    }
+
+    private void tickHouseBuild(Player owner, Mob agent) {
+        String path = jobPath(agent);
+        World world = Bukkit.getWorld(getConfig().getString(path + ".world", ""));
+        if (world == null || !world.equals(agent.getWorld())) return;
+        List<Map<?, ?>> blocks = getConfig().getMapList(path + ".blocks");
+        int progress = getConfig().getInt(path + ".progress", 0);
+        if (progress >= blocks.size()) {
+            finishJob(owner, agent, "completed", "The house is finished! Check our shared supplies for what’s left.");
+            return;
+        }
+        if (!getConfig().getBoolean(path + ".materials_reserved", false)) {
+            if (!reserveHouseMaterials(owner, agent, blocks)) return;
+        }
+        Location workSpot = new Location(world, getConfig().getDouble(path + ".worker_x"),
+                getConfig().getDouble(path + ".worker_y"), getConfig().getDouble(path + ".worker_z"));
+        if (agent.getLocation().distance(workSpot) > 2.25) {
+            agent.getPathfinder().moveTo(workSpot, 1.0);
+            return;
+        }
+        agent.getPathfinder().stopPathfinding();
+        Map<?, ?> cell = blocks.get(progress);
+        int x = ((Number) cell.get("x")).intValue();
+        int y = ((Number) cell.get("y")).intValue();
+        int z = ((Number) cell.get("z")).intValue();
+        Material material = Material.matchMaterial(String.valueOf(cell.get("material")));
+        Block target = world.getBlockAt(x, y, z);
+        if (!validBlueprintBlock(0, 0, 0, material) || !target.getType().isAir()) {
+            refundUnbuiltHouse(agent);
+            finishJob(owner, agent, "stopped_safe", "Something entered the build footprint. I stopped and refunded the blocks I hadn’t placed.");
+            return;
+        }
+        if (isWoodenDoor(material)) {
+            Block upper = world.getBlockAt(x, y + 1, z);
+            if (!upper.getType().isAir()) {
+                refundUnbuiltHouse(agent);
+                finishJob(owner, agent, "stopped_safe", "Something blocked the doorway. I stopped and refunded the blocks I hadn’t placed.");
+                return;
+            }
+            BlockFace facing;
+            try {
+                facing = BlockFace.valueOf(getConfig().getString(path + ".door_facing", "NORTH"));
+            } catch (IllegalArgumentException exception) {
+                facing = BlockFace.NORTH;
+            }
+            Door bottom = (Door) material.createBlockData();
+            bottom.setHalf(Bisected.Half.BOTTOM);
+            bottom.setFacing(facing);
+            Door top = (Door) material.createBlockData();
+            top.setHalf(Bisected.Half.TOP);
+            top.setFacing(facing);
+            target.setType(material, false);
+            target.setBlockData(bottom, false);
+            upper.setType(material, false);
+            upper.setBlockData(top, false);
+        } else {
+            target.setType(material, false);
+        }
+        agent.swingMainHand();
+        getConfig().set(path + ".progress", progress + 1);
+        saveConfig();
+        if ((progress + 1) % 16 == 0) agentSay(owner, agentName(agent), "The house is taking shape — " + (progress + 1) + " of " + blocks.size() + " blocks placed.");
+    }
+
+    private boolean reserveHouseMaterials(Player owner, Mob agent, List<Map<?, ?>> blocks) {
+        String path = jobPath(agent);
+        Map<Material, Integer> needed = new HashMap<>();
+        for (Map<?, ?> block : blocks) {
+            Material material = Material.matchMaterial(String.valueOf(block.get("material")));
+            if (material == null) {
+                finishJob(owner, agent, "failed", "I found an invalid material in the house blueprint and stopped.");
+                return false;
+            }
+            if (isWoodenDoor(material)) needed.merge(planksForDoor(material), 6, Integer::sum);
+            else needed.merge(material, 1, Integer::sum);
+        }
+        for (Map.Entry<Material, Integer> entry : needed.entrySet()) {
+            if (supplyCount(owner.getUniqueId(), entry.getKey()) < entry.getValue()) {
+                changeJobStatus(owner, agent, "waiting_for_materials", "I’ve got the house plan, but I’m waiting for "
+                        + entry.getValue() + " " + entry.getKey().name().toLowerCase(Locale.ROOT) + ". Ask another agent to gather or mine the materials.");
+                return false;
+            }
+        }
+        needed.forEach((material, count) -> adjustSupply(owner.getUniqueId(), material, -count));
+        getConfig().set(path + ".materials_reserved", true);
+        changeJobStatus(owner, agent, "running", "The supplies are ready. I’m starting the house now.");
+        saveConfig();
+        return true;
+    }
+
+    private int supplyCount(UUID ownerId, Material material) {
+        return getConfig().getInt(ownerSupplyPath(ownerId) + "." + material.name(), 0);
+    }
+
+    private void adjustSupply(UUID ownerId, Material material, int amount) {
+        String key = ownerSupplyPath(ownerId) + "." + material.name();
+        int updated = Math.max(0, getConfig().getInt(key, 0) + amount);
+        getConfig().set(key, updated == 0 ? null : updated);
+    }
+
+    private void changeJobStatus(Player owner, Mob agent, String status, String message) {
+        String path = jobPath(agent);
+        if (status.equals(getConfig().getString(path + ".status", ""))) return;
+        getConfig().set(path + ".status", status);
+        saveConfig();
+        if (owner != null && owner.isOnline()) agentSay(owner, agentName(agent), message);
+    }
+
+    private void finishJob(Player owner, Mob agent, String status, String message) {
+        if (activeJob(agent)) {
+            getConfig().set(jobPath(agent) + ".status", status);
+            saveConfig();
+        }
+        agent.getPathfinder().stopPathfinding();
+        if (owner != null && owner.isOnline()) agentSay(owner, agentName(agent), message);
     }
 
     private boolean removeAgent(CommandSender sender, String[] args) {
@@ -867,7 +1658,9 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         }
         String name = agentName(agent);
         UUID id = agent.getUniqueId();
+        invalidatePendingPlan(agent);
         cancelFollow(id);
+        cancelJob(player, agent, true);
         pendingPlans.remove(id);
         pendingInboxSnapshots.remove(id);
         for (Entity passenger : List.copyOf(agent.getPassengers())) passenger.remove();
@@ -886,6 +1679,9 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             player.sendMessage("§c[GeneCraft] §fThe AI returned invalid action arguments; nothing was executed.");
             return;
         }
+        if (result.has("sources") && result.get("sources").isJsonArray()) {
+            sendSourceLinks(player, result.getAsJsonArray("sources"));
+        }
         String name = agentName(agent);
         switch (action) {
             case "speak" -> {
@@ -897,7 +1693,9 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 }
             }
             case "follow_player" -> {
-                if (!agent.getWorld().equals(player.getWorld()) || agent.getLocation().distance(player.getLocation()) > PLAYER_ACTION_LIMIT) {
+                if (activeJob(agent)) {
+                    player.sendMessage("§d[GeneCraft] §f" + name + " is busy with a saved work order. Cancel it first if you want them to follow you.");
+                } else if (!agent.getWorld().equals(player.getWorld()) || agent.getLocation().distance(player.getLocation()) > PLAYER_ACTION_LIMIT) {
                     player.sendMessage("§d[GeneCraft] §fI only follow within " + (int) PLAYER_ACTION_LIMIT + " blocks.");
                 } else {
                     beginFollow(player, agent);
@@ -911,6 +1709,8 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 } else if (!destination.getWorld().equals(agent.getWorld())
                         || destination.distance(agent.getLocation()) > WAYPOINT_ACTION_LIMIT) {
                     player.sendMessage("§d[GeneCraft] §fThat waypoint is outside this local demo's 64-block movement limit.");
+                } else if (activeJob(agent)) {
+                    player.sendMessage("§d[GeneCraft] §f" + name + " is busy with a saved work order. Cancel it before changing destinations.");
                 } else {
                     cancelFollow(agent.getUniqueId());
                     boolean started = agent.getPathfinder().moveTo(destination, 1.0);
@@ -920,6 +1720,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             }
             case "stop_moving" -> {
                 cancelFollow(agent.getUniqueId());
+                if (activeJob(agent)) cancelJob(player, agent, true);
                 agent.getPathfinder().stopPathfinding();
                 player.sendMessage("§b[GeneCraft] §f" + name + " stopped moving.");
             }
@@ -933,6 +1734,11 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 }
             }
             case "message_agent" -> sendAgentMessage(player, agent, arguments.get("recipient").getAsString(), arguments.get("text").getAsString());
+            case "start_gather_wood" -> startGatherWood(player, agent, arguments.get("target_logs").getAsInt());
+            case "start_strip_mine" -> startStripMine(player, agent, arguments.get("length").getAsInt(), arguments.get("y_level").getAsInt());
+            case "start_house_build" -> startHouseBuild(player, agent, arguments.getAsJsonArray("blueprint"),
+                    result.has("sources") && result.get("sources").isJsonArray() ? result.getAsJsonArray("sources") : null);
+            case "cancel_job" -> cancelJob(player, agent, true);
             default -> player.sendMessage("§c[GeneCraft] §fThe AI requested an action this version does not allow; nothing was executed.");
         }
     }
@@ -963,9 +1769,51 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                     && arguments.getAsJsonPrimitive("note").isString()
                     && !arguments.get("note").getAsString().isBlank()
                     && arguments.get("note").getAsString().length() <= 160;
+            case "start_gather_wood" -> arguments.size() == 1
+                    && arguments.has("target_logs") && arguments.get("target_logs").isJsonPrimitive()
+                    && isInteger(arguments.getAsJsonPrimitive("target_logs"))
+                    && arguments.get("target_logs").getAsInt() >= 1 && arguments.get("target_logs").getAsInt() <= 64;
+            case "start_strip_mine" -> arguments.size() == 3
+                    && arguments.has("length") && arguments.get("length").isJsonPrimitive()
+                    && isInteger(arguments.getAsJsonPrimitive("length"))
+                    && arguments.get("length").getAsInt() >= 4 && arguments.get("length").getAsInt() <= 32
+                    && arguments.has("y_level") && arguments.get("y_level").isJsonPrimitive()
+                    && isInteger(arguments.getAsJsonPrimitive("y_level"))
+                    && arguments.get("y_level").getAsInt() >= -60
+                    && arguments.get("y_level").getAsInt() <= 319
+                    && arguments.has("direction") && arguments.get("direction").isJsonPrimitive()
+                    && "player_facing".equals(arguments.get("direction").getAsString());
+            case "start_house_build" -> validHouseBlueprint(arguments);
             case "follow_player", "stop_moving" -> arguments.isEmpty();
+            case "cancel_job" -> arguments.isEmpty();
             default -> false;
         };
+    }
+
+    private boolean isInteger(com.google.gson.JsonPrimitive value) {
+        return value.isNumber() && value.getAsString().matches("-?(0|[1-9][0-9]*)");
+    }
+
+    private boolean validHouseBlueprint(JsonObject arguments) {
+        if (arguments.size() != 1 || !arguments.has("blueprint") || !arguments.get("blueprint").isJsonArray()) return false;
+        JsonArray blueprint = arguments.getAsJsonArray("blueprint");
+        if (blueprint.size() < 12 || blueprint.size() > 120) return false;
+        Set<String> coordinates = new HashSet<>();
+        for (JsonElement element : blueprint) {
+            if (!element.isJsonObject()) return false;
+            JsonObject block = element.getAsJsonObject();
+            if (block.size() != 4 || !block.has("x") || !block.has("y") || !block.has("z") || !block.has("material")
+                    || !block.get("x").isJsonPrimitive() || !block.get("y").isJsonPrimitive() || !block.get("z").isJsonPrimitive()
+                    || !isInteger(block.getAsJsonPrimitive("x")) || !isInteger(block.getAsJsonPrimitive("y"))
+                    || !isInteger(block.getAsJsonPrimitive("z")) || !block.get("material").isJsonPrimitive()
+                    || !block.getAsJsonPrimitive("material").isString()) return false;
+            int x = block.get("x").getAsInt();
+            int y = block.get("y").getAsInt();
+            int z = block.get("z").getAsInt();
+            Material material = Material.matchMaterial(block.get("material").getAsString());
+            if (!validBlueprintBlock(x, y, z, material) || !coordinates.add(x + "," + y + "," + z)) return false;
+        }
+        return true;
     }
 
     private JsonObject context(Player player, Mob agent) {
@@ -974,6 +1822,11 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         context.add("agent_position", position(agent.getLocation()));
         context.addProperty("agent_health", agent.getHealth());
         context.add("player_position", position(player.getLocation()));
+        context.addProperty("player_y_level", player.getLocation().getBlockY());
+        Vector look = player.getLocation().getDirection();
+        String facing = Math.abs(look.getX()) > Math.abs(look.getZ())
+                ? (look.getX() >= 0 ? "east" : "west") : (look.getZ() >= 0 ? "south" : "north");
+        context.addProperty("player_facing", facing);
         context.addProperty("world_time_ticks", agent.getWorld().getTime());
         context.addProperty("weather", agent.getWorld().hasStorm() ? "rain" : "clear");
         context.addProperty("ground_block", agent.getLocation().clone().subtract(0, 1, 0).getBlock().getType().getKey().toString());
@@ -1018,6 +1871,28 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             messages.add(item);
         }
         context.add("inbox", messages);
+        JsonObject job = new JsonObject();
+        String path = jobPath(agent);
+        if (getConfig().contains(path + ".kind")) {
+            job.addProperty("kind", getConfig().getString(path + ".kind", ""));
+            job.addProperty("status", getConfig().getString(path + ".status", ""));
+            job.addProperty("progress", getConfig().getInt(path + ".progress", 0));
+            if (getConfig().contains(path + ".target")) job.addProperty("target", getConfig().getInt(path + ".target"));
+            if (getConfig().contains(path + ".length")) job.addProperty("length", getConfig().getInt(path + ".length"));
+            if (getConfig().contains(path + ".start_y")) job.addProperty("y_level", getConfig().getInt(path + ".start_y"));
+            context.add("current_job", job);
+        } else {
+            context.add("current_job", new JsonObject());
+        }
+        JsonObject supplies = new JsonObject();
+        var supplySection = getConfig().getConfigurationSection(ownerSupplyPath(player.getUniqueId()));
+        if (supplySection != null) {
+            for (String material : supplySection.getKeys(false)) {
+                int count = supplySection.getInt(material, 0);
+                if (count > 0) supplies.addProperty(material, count);
+            }
+        }
+        context.add("shared_supplies", supplies);
         return context;
     }
 
@@ -1344,7 +2219,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 .decorate(TextDecoration.BOLD)
                 .clickEvent(ClickEvent.runCommand("/genecraft login continue"))
                 .hoverEvent(HoverEvent.showText(Component.text("Open OpenAI sign-in and review the requested permissions."))));
-        sender.sendMessage(Component.text("The model can only choose GeneCraft's six bounded actions. The local pathfinding demo works without sign-in.")
+        sender.sendMessage(Component.text("The model can only choose GeneCraft's bounded chat, movement, and work-order actions. The local pathfinding demo works without sign-in.")
                 .color(NamedTextColor.GRAY));
     }
 
@@ -1380,8 +2255,11 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         sender.sendMessage("§f/genecraft rename <old> <new> §7rename a nearby agent");
         sender.sendMessage("§f/genecraft demo <name> §7run safe pathfinding without AI sign-in");
         sender.sendMessage("§f/genecraft waypoint set <name> §7save your position");
+        sender.sendMessage("§f@<agent> <message> §7chat naturally and give direct orders");
         sender.sendMessage("§f/genecraft ask <name> <request> §7ask the GPT agent to act");
-        sender.sendMessage("§f/genecraft stop <name> §7stop its movement");
+        sender.sendMessage("§f/genecraft job <name> status|cancel §7check or cancel saved work");
+        sender.sendMessage("§f/genecraft supplies §7view shared agent materials");
+        sender.sendMessage("§f/genecraft stop <name> §7stop movement and cancel its work");
         sender.sendMessage("§f/genecraft remove <name> §7remove an agent and saved state");
         sender.sendMessage("§f/genecraft goal <name> set <goal> §7save a persistent goal");
         sender.sendMessage("§f/genecraft autonomy <name> on [seconds] §7enable bounded observation");
