@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible GeneCraft problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Please remove passwords, OAuth data, bridge tokens, and private world information before posting.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Minecraft, Paper, Java, and GeneCraft versions
+      placeholder: Minecraft 1.21.11 / Paper build ... / Java 21 / GeneCraft 0.2.0
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: What happened?
+      description: Include steps to reproduce and the expected result.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove personal information and credentials first.
+      render: text

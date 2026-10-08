@@ -1,0 +1,16 @@
+name: GeneCraft
+version: 0.2.0
+main: dev.genecraft.GeneCraftPlugin
+api-version: '1.21.11'
+description: Local-first persistent AI agents in a Minecraft sandbox.
+authors: [GeneCraft contributors]
+commands:
+  genecraft:
+    aliases: [genesis, fable]
+    description: Control your GeneCraft agents.
+    usage: /genecraft help
+    permission: genecraft.use
+permissions:
+  genecraft.use:
+    description: Use GeneCraft commands.
+    default: true

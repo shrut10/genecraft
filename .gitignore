@@ -1,0 +1,28 @@
+# Build and local Python runtime
+/target/
+/.venv/
+/runtime/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration, OAuth data, and credentials
+.env
+.env.*
+*.token
+accounts.json
+host-id
+settings.json
+.config/
+
+# Generated Minecraft server and client data
+/server/
+/world/
+/world_nether/
+/world_the_end/
+*.jar
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+NOT AN OFFICIAL MINECRAFT PRODUCT OR SERVICE. NOT APPROVED BY OR ASSOCIATED WITH
+MOJANG OR MICROSOFT.
+
+GeneCraft is an independent project and is not affiliated with, endorsed by,
+or sponsored by Mojang Studios, Microsoft, or OpenAI.
+
+GeneCraft source code is licensed under the MIT License. Minecraft, Minecraft
+Java Edition, Paper, and OpenAI are names and products of their respective
+owners. This repository does not include Minecraft game files, assets, or a
+Paper server distribution.
+
+Third-party runtime dependency: Gson 2.13.1, Copyright 2008 Google Inc.,
+licensed under the Apache License, Version 2.0. Its license is included in the
+plugin JAR at META-INF/LICENSE-gson-2.13.1.txt. Paper API is a provided
+compile-time dependency and is not bundled. See README.md for dependency and
+distribution notes.
