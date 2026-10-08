@@ -11,7 +11,7 @@ body:
     attributes:
       label: Versions
       description: Minecraft, Paper, Java, and GeneCraft versions
-      placeholder: Minecraft 1.21.11 / Paper build ... / Java 21 / GeneCraft 0.2.0
+      placeholder: Minecraft 1.21.11 / Paper build ... / Java 21 / GeneCraft 0.2.1
     validations:
       required: true
   - type: textarea

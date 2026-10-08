@@ -441,7 +441,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "GeneCraftBridge/0.2"
+    server_version = "GeneCraftBridge/0.2.1"
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return

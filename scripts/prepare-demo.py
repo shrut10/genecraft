@@ -18,8 +18,8 @@ DEMO_HOME = Path(os.environ.get(
     os.environ.get("FABLEORBIT_DEMO_HOME", str(Path.home() / "Minecraft" / "GeneCraft Demo")),
 )).expanduser()
 SERVER_DIR = DEMO_HOME / "server"
-PLUGIN_JAR = ROOT / "target" / "genecraft-paper-0.2.0.jar"
-USER_AGENT = "GeneCraft setup/0.2 (https://github.com/shrut10/genecraft)"
+PLUGIN_JAR = ROOT / "target" / "genecraft-paper-0.2.1.jar"
+USER_AGENT = "GeneCraft setup/0.2.1 (https://github.com/shrut10/genecraft)"
 
 
 def fetch_json(url: str) -> object:

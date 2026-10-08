@@ -605,11 +605,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             agent.setCustomNameVisible(false);
             agent.getPersistentDataContainer().set(agentSkinKey, PersistentDataType.STRING, skinName);
             if (!attachPlayerAvatar(agent, name, skinName)) {
-                agent.setInvisible(false);
-                agent.getPersistentDataContainer().set(agentFormKey, PersistentDataType.STRING, "villager");
-                agent.getPersistentDataContainer().remove(agentSkinKey);
-                agent.setCustomName("§d" + name + " §7[GeneCraft]");
-                agent.setCustomNameVisible(true);
+                fallbackPlayerAvatar(agent, name);
                 player.sendMessage("§b[GeneCraft] §fThe player-style display could not attach here; I spawned the standard villager form instead.");
             }
         } else {
@@ -652,15 +648,41 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         }
         profile.update().whenComplete((updated, error) -> Bukkit.getScheduler().runTask(this, () -> {
             Entity current = Bukkit.getEntity(controllerId);
-            if (!(current instanceof Mob liveController) || !liveController.isValid() || error != null || updated == null) {
-                if (error != null) getLogger().warning("Could not fetch the requested Minecraft skin for " + name + ".");
+            if (!(current instanceof Mob liveController) || !liveController.isValid()) return;
+            if (error != null || updated == null) {
+                getLogger().warning("Could not fetch the requested Minecraft skin for " + name + "; using a villager instead.");
+                fallbackPlayerAvatar(liveController, name);
                 return;
             }
-            liveController.getPassengers().stream().filter(Mannequin.class::isInstance)
-                    .map(Mannequin.class::cast).findFirst()
-                    .ifPresent(liveAvatar -> liveAvatar.setProfile(ResolvableProfile.resolvableProfile(updated)));
+            Mannequin liveAvatar = liveController.getPassengers().stream()
+                    .filter(Mannequin.class::isInstance).map(Mannequin.class::cast).findFirst().orElse(null);
+            if (liveAvatar == null) {
+                getLogger().warning("Player-style display for " + name + " was removed before the skin loaded; using a villager instead.");
+                fallbackPlayerAvatar(liveController, name);
+                return;
+            }
+            liveAvatar.setProfile(ResolvableProfile.resolvableProfile(updated));
         }));
         return true;
+    }
+
+    private void fallbackPlayerAvatar(Mob controller, String name) {
+        for (Entity passenger : List.copyOf(controller.getPassengers())) {
+            if (passenger instanceof Mannequin) passenger.remove();
+        }
+        controller.setInvisible(false);
+        controller.setSilent(false);
+        controller.setCustomName("§d" + name + " §7[GeneCraft]");
+        controller.setCustomNameVisible(true);
+        controller.getPersistentDataContainer().set(agentFormKey, PersistentDataType.STRING, "villager");
+        controller.getPersistentDataContainer().remove(agentSkinKey);
+        String ownerId = controller.getPersistentDataContainer().get(agentOwnerKey, PersistentDataType.STRING);
+        try {
+            Player owner = ownerId == null ? null : Bukkit.getPlayer(UUID.fromString(ownerId));
+            if (owner != null) owner.sendMessage("§b[GeneCraft] §fSkin lookup failed; " + name + " is using the villager form.");
+        } catch (IllegalArgumentException ignored) {
+            // An invalid or legacy owner field must not break the visible fallback.
+        }
     }
 
     private void updateAgentLabel(Mob agent, String name) {

@@ -21,7 +21,7 @@ The observation loop is deliberately bounded: it runs at a configurable interval
 
 ### 1. Get the plugin
 
-Download `genecraft-paper-0.2.0.jar` from [Releases](https://github.com/shrut10/genecraft/releases) and place it in the `plugins` folder of a Paper server running Minecraft 1.21.11 or compatible. Start the server once and review its EULA prompt. The demo-preparation script below can create a private local server and install the plugin for you.
+Download the latest `genecraft-paper-*.jar` from [Releases](https://github.com/shrut10/genecraft/releases) and place it in the `plugins` folder of a Paper server running Minecraft 1.21.11 or compatible. Start the server once and review its EULA prompt. The demo-preparation script below can create a private local server and install the plugin for you.
 
 ### 2. Prepare a private demo server (optional)
 
@@ -94,7 +94,7 @@ python3 -m pip install -r bridge/requirements.txt
 python3 -m unittest discover -s tests -v
 ```
 
-The shaded plugin is created at `target/genecraft-paper-0.2.0.jar`. GitHub Actions builds and runs the bridge tests on Ubuntu, macOS, and Windows for pushes and pull requests.
+The shaded plugin is created at `target/genecraft-paper-<version>.jar`. GitHub Actions builds and runs the bridge tests on Ubuntu, macOS, and Windows for pushes and pull requests.
 
 ## Privacy and security
 

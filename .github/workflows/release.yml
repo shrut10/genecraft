@@ -33,4 +33,4 @@ jobs:
       - name: Create GitHub release with plugin JAR
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" target/genecraft-paper-0.2.0.jar --title "GeneCraft $GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" target/genecraft-paper-*.jar --title "GeneCraft $GITHUB_REF_NAME" --generate-notes
