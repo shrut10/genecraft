@@ -1,5 +1,5 @@
 name: GeneCraft
-version: 0.3.1
+version: 0.3.2
 main: dev.genecraft.GeneCraftPlugin
 api-version: '1.21.11'
 description: Local-first persistent AI agents in a Minecraft sandbox.
