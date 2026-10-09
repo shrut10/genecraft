@@ -38,6 +38,7 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import io.papermc.paper.event.player.AsyncChatEvent;
 import org.bukkit.projectiles.ProjectileSource;
 import org.bukkit.persistence.PersistentDataType;
@@ -81,6 +82,8 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
     private static final double WAYPOINT_ACTION_LIMIT = 64.0;
     private static final double GUARD_KILL_RADIUS = 12.0;
     private static final double GUARD_ALERT_RADIUS = 18.0;
+    private static final int WOOD_SEARCH_RADIUS = 24;
+    private static final long WOOD_RESCAN_DELAY_MS = 3000L;
     private static final String PERSISTENT_NAMESPACE = "fableorbit";
 
     private NamespacedKey agentNameKey;
@@ -116,6 +119,16 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         Bukkit.getScheduler().runTaskTimer(this, this::tickJobs, 20L, 10L);
         Bukkit.getScheduler().runTask(this, this::relabelExistingAgents);
         getLogger().info("GeneCraft ready. Use /genecraft help to start.");
+    }
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        Player player = event.getPlayer();
+        for (Mob agent : ownedAgents(player)) {
+            if (!activeJob(agent)) continue;
+            agent.getPathfinder().stopPathfinding();
+            changeJobStatus(null, agent, "waiting_for_owner", "");
+        }
     }
 
     @Override
@@ -1006,16 +1019,19 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         job.put("kind", "gather_wood");
         job.put("status", "running");
         job.put("world", agent.getWorld().getName());
-        job.put("anchor_x", agent.getLocation().getBlockX());
-        job.put("anchor_y", agent.getLocation().getBlockY());
-        job.put("anchor_z", agent.getLocation().getBlockZ());
+        // Center the first search on the player who gave the order. Agents can
+        // spawn a few blocks away, and the owner may have moved to the trees.
+        job.put("anchor_x", player.getLocation().getBlockX());
+        job.put("anchor_y", player.getLocation().getBlockY());
+        job.put("anchor_z", player.getLocation().getBlockZ());
         job.put("target", targetLogs);
         job.put("progress", 0);
         job.put("created_at", System.currentTimeMillis());
         getConfig().set(jobPath(agent), job);
         saveConfig();
         agentSay(player, agentName(agent), "On it. I’ll collect up to " + targetLogs
-                + " nearby logs and add the planks to our shared supplies. Stay within 32 blocks so I can keep working.");
+                + " logs from trees within " + WOOD_SEARCH_RADIUS
+                + " blocks of you and add the planks to our shared supplies. Stay within 32 blocks so I can keep working.");
     }
 
     private void startStripMine(Player player, Mob agent, int length, int yLevel) {
@@ -1303,7 +1319,15 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             for (Mob agent : ownedAgents(owner)) {
                 if (!activeJob(agent)) continue;
                 if (!agent.getWorld().equals(owner.getWorld())
-                        || agent.getLocation().distance(owner.getLocation()) > PLAYER_ACTION_LIMIT) continue;
+                        || agent.getLocation().distance(owner.getLocation()) > PLAYER_ACTION_LIMIT) {
+                    agent.getPathfinder().stopPathfinding();
+                    changeJobStatus(owner, agent, "waiting_for_owner",
+                            "I paused the work because you’re more than 32 blocks away. Come back nearby and I’ll resume.");
+                    continue;
+                }
+                if (getConfig().getString(jobPath(agent) + ".status", "").equals("waiting_for_owner")) {
+                    changeJobStatus(owner, agent, "running", "You’re back nearby. I’m resuming the work.");
+                }
                 String kind = getConfig().getString(jobPath(agent) + ".kind", "");
                 switch (kind) {
                     case "gather_wood" -> tickGatherWood(owner, agent);
@@ -1330,9 +1354,6 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         String worldName = getConfig().getString(path + ".world", "");
         World world = Bukkit.getWorld(worldName);
         if (world == null || !world.equals(agent.getWorld())) return;
-        int ax = getConfig().getInt(path + ".anchor_x");
-        int ay = getConfig().getInt(path + ".anchor_y");
-        int az = getConfig().getInt(path + ".anchor_z");
         int targetX = getConfig().getInt(path + ".target_x", Integer.MIN_VALUE);
         int targetY = getConfig().getInt(path + ".target_y", Integer.MIN_VALUE);
         int targetZ = getConfig().getInt(path + ".target_z", Integer.MIN_VALUE);
@@ -1342,34 +1363,69 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             if (isTreeLog(existing.getType())) log = existing;
         }
         if (log == null) {
-            log = findNearbyLog(world, agent, ax, ay, az);
+            long nextSearchAt = getConfig().getLong(path + ".next_search_at", 0L);
+            if (System.currentTimeMillis() < nextSearchAt) return;
+            log = findNearbyLog(world, owner, agent);
             if (log == null) {
-                changeJobStatus(owner, agent, "waiting_for_logs", "I can’t see another tree within my 12-block work area. Bring me to a wooded spot or cancel this job.");
+                getConfig().set(path + ".next_search_at", System.currentTimeMillis() + WOOD_RESCAN_DELAY_MS);
+                saveConfig();
+                changeJobStatus(owner, agent, "waiting_for_logs", "I can’t find a tree within "
+                        + WOOD_SEARCH_RADIUS + " blocks of you yet. Move us closer to trees and I’ll keep looking.");
                 return;
             }
+            getConfig().set(path + ".next_search_at", null);
+            clearGatherTarget(path);
             getConfig().set(path + ".target_x", log.getX());
             getConfig().set(path + ".target_y", log.getY());
             getConfig().set(path + ".target_z", log.getZ());
             saveConfig();
             changeJobStatus(owner, agent, "running", "I found another tree. I’m continuing the wood run.");
         }
-        Location approach = findLogApproach(agent, log, ay);
+        Location approach = savedLogApproach(path, world, log);
         if (approach == null) {
-            getConfig().set(path + ".target_x", null);
-            getConfig().set(path + ".target_y", null);
-            getConfig().set(path + ".target_z", null);
+            approach = findLogApproach(agent, log);
+            if (approach != null) {
+                getConfig().set(path + ".approach_x", approach.getBlockX());
+                getConfig().set(path + ".approach_y", approach.getBlockY());
+                getConfig().set(path + ".approach_z", approach.getBlockZ());
+                saveConfig();
+            }
+        }
+        if (approach == null) {
+            clearGatherTarget(path);
+            getConfig().set(path + ".next_search_at", System.currentTimeMillis() + WOOD_RESCAN_DELAY_MS);
             saveConfig();
+            changeJobStatus(owner, agent, "waiting_for_logs", "I found a tree but can’t reach its trunk from here. Move us to clearer ground and I’ll try again.");
             return;
         }
         if (agent.getLocation().distance(approach) > 2.8) {
-            agent.getPathfinder().moveTo(approach, 1.0);
+            var pathfinder = agent.getPathfinder();
+            boolean alreadyHeadingThere = pathfinder.hasPath()
+                    && getConfig().getInt(path + ".route_x", Integer.MIN_VALUE) == approach.getBlockX()
+                    && getConfig().getInt(path + ".route_y", Integer.MIN_VALUE) == approach.getBlockY()
+                    && getConfig().getInt(path + ".route_z", Integer.MIN_VALUE) == approach.getBlockZ();
+            // Reissuing the same move every half second can interrupt navigation
+            // and make an agent appear to wander. Keep the active path until it
+            // reaches its destination or actually fails.
+            if (!alreadyHeadingThere) {
+                if (!pathfinder.moveTo(approach, 1.0)) {
+                    clearGatherTarget(path);
+                    getConfig().set(path + ".next_search_at", System.currentTimeMillis() + WOOD_RESCAN_DELAY_MS);
+                    saveConfig();
+                    changeJobStatus(owner, agent, "waiting_for_logs", "I found a tree but can’t path to it. I’ll look for another reachable tree nearby.");
+                } else {
+                    getConfig().set(path + ".route_x", approach.getBlockX());
+                    getConfig().set(path + ".route_y", approach.getBlockY());
+                    getConfig().set(path + ".route_z", approach.getBlockZ());
+                    saveConfig();
+                }
+            }
             return;
         }
+        agent.getPathfinder().stopPathfinding();
         Material plank = planksForLog(log.getType());
         if (plank == null) {
-            getConfig().set(path + ".target_x", null);
-            getConfig().set(path + ".target_y", null);
-            getConfig().set(path + ".target_z", null);
+            clearGatherTarget(path);
             saveConfig();
             return;
         }
@@ -1378,22 +1434,53 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         world.playSound(soundAt, org.bukkit.Sound.BLOCK_WOOD_BREAK, 0.8f, 1.0f);
         adjustSupply(owner.getUniqueId(), plank, 4);
         getConfig().set(path + ".progress", gathered + 1);
-        getConfig().set(path + ".target_x", null);
-        getConfig().set(path + ".target_y", null);
-        getConfig().set(path + ".target_z", null);
+        clearGatherTarget(path);
         saveConfig();
         if ((gathered + 1) % 4 == 0) {
             agentSay(owner, agentName(agent), "I’ve collected " + (gathered + 1) + " logs so far.");
         }
     }
 
-    private Block findNearbyLog(World world, Mob agent, int anchorX, int anchorY, int anchorZ) {
+    private void clearGatherTarget(String path) {
+        for (String key : List.of("target_x", "target_y", "target_z", "approach_x", "approach_y", "approach_z", "route_x", "route_y", "route_z")) {
+            getConfig().set(path + "." + key, null);
+        }
+    }
+
+    private Location savedLogApproach(String path, World world, Block log) {
+        int x = getConfig().getInt(path + ".approach_x", Integer.MIN_VALUE);
+        int y = getConfig().getInt(path + ".approach_y", Integer.MIN_VALUE);
+        int z = getConfig().getInt(path + ".approach_z", Integer.MIN_VALUE);
+        if (x == Integer.MIN_VALUE || y == Integer.MIN_VALUE || z == Integer.MIN_VALUE
+                || Math.abs(x - log.getX()) > 1 || Math.abs(z - log.getZ()) > 1
+                || !isStandable(world, x, y, z)) return null;
+        return new Location(world, x + 0.5, y, z + 0.5);
+    }
+
+    private boolean isStandable(World world, int x, int y, int z) {
+        if (!world.isChunkLoaded(x >> 4, z >> 4) || y <= world.getMinHeight() || y + 1 >= world.getMaxHeight()) return false;
+        Block feet = world.getBlockAt(x, y, z);
+        Block head = world.getBlockAt(x, y + 1, z);
+        Block floor = world.getBlockAt(x, y - 1, z);
+        return feet.isPassable() && !feet.isLiquid() && head.isPassable() && !head.isLiquid()
+                && !floor.isPassable() && !floor.isLiquid();
+    }
+
+    private Block findNearbyLog(World world, Player owner, Mob agent) {
+        Location center = owner.getLocation();
+        int anchorX = center.getBlockX();
+        int anchorY = center.getBlockY();
+        int anchorZ = center.getBlockZ();
+        int radiusSquared = WOOD_SEARCH_RADIUS * WOOD_SEARCH_RADIUS;
         Block best = null;
         double bestDistance = Double.MAX_VALUE;
-        for (int x = anchorX - 12; x <= anchorX + 12; x++) {
-            for (int z = anchorZ - 12; z <= anchorZ + 12; z++) {
+        for (int x = anchorX - WOOD_SEARCH_RADIUS; x <= anchorX + WOOD_SEARCH_RADIUS; x++) {
+            for (int z = anchorZ - WOOD_SEARCH_RADIUS; z <= anchorZ + WOOD_SEARCH_RADIUS; z++) {
+                int dx = x - anchorX;
+                int dz = z - anchorZ;
+                if (dx * dx + dz * dz > radiusSquared) continue;
                 if (!world.isChunkLoaded(x >> 4, z >> 4)) continue;
-                for (int y = Math.max(world.getMinHeight(), anchorY - 10); y <= Math.min(world.getMaxHeight() - 1, anchorY + 14); y++) {
+                for (int y = Math.max(world.getMinHeight(), anchorY - 16); y <= Math.min(world.getMaxHeight() - 1, anchorY + 24); y++) {
                     Block block = world.getBlockAt(x, y, z);
                     if (!isTreeLog(block.getType())) continue;
                     double distance = block.getLocation().distanceSquared(agent.getLocation());
@@ -1407,7 +1494,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         return best;
     }
 
-    private Location findLogApproach(Mob agent, Block log, int anchorY) {
+    private Location findLogApproach(Mob agent, Block log) {
         World world = log.getWorld();
         int[][] offsets = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
         Location best = null;
@@ -1416,11 +1503,9 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             int x = log.getX() + offset[0];
             int z = log.getZ() + offset[1];
             if (!world.isChunkLoaded(x >> 4, z >> 4)) continue;
-            for (int y = Math.max(world.getMinHeight() + 1, anchorY - 3); y <= Math.min(world.getMaxHeight() - 2, anchorY + 5); y++) {
-                Block feet = world.getBlockAt(x, y, z);
-                Block head = world.getBlockAt(x, y + 1, z);
-                Block floor = world.getBlockAt(x, y - 1, z);
-                if (!feet.isPassable() || !head.isPassable() || floor.isPassable() || floor.isLiquid()) continue;
+            int surfaceY = world.getHighestBlockYAt(x, z);
+            for (int y = Math.max(world.getMinHeight() + 1, surfaceY - 24); y <= Math.min(world.getMaxHeight() - 2, surfaceY + 1); y++) {
+                if (!isStandable(world, x, y, z)) continue;
                 Location candidate = new Location(world, x + 0.5, y, z + 0.5);
                 double distance = candidate.distanceSquared(agent.getLocation());
                 if (distance < bestDistance) {
