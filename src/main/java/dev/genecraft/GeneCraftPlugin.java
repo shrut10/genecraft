@@ -935,7 +935,8 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             player.sendMessage("Use /genecraft job <agent> status or cancel");
             return true;
         }
-        Mob agent = findAgent(player, args[1]);
+        Mob agent = findAgentWithSavedJob(player, args[1]);
+        if (agent == null) agent = findAgent(player, args[1]);
         if (agent == null) {
             player.sendMessage("§d[GeneCraft] §fI can't find that agent nearby.");
             return true;
@@ -2161,8 +2162,23 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 .filter(v -> v.getPersistentDataContainer().has(agentNameKey, PersistentDataType.STRING))
                 .filter(v -> name.equalsIgnoreCase(agentName(v)))
                 .filter(v -> ownsAgent(player, v))
-                .min(Comparator.comparingDouble(v -> v.getLocation().distanceSquared(player.getLocation())))
                 .filter(v -> v.getLocation().distance(player.getLocation()) <= 48.0)
+                // If older worlds contain duplicate names, route commands to
+                // the entity that owns the saved work order before choosing
+                // the nearest idle copy. This keeps /job status/cancel and
+                // natural-language requests aligned with the active worker.
+                .min(Comparator.<Mob, Boolean>comparing(v -> !activeJob(v))
+                        .thenComparingDouble(v -> v.getLocation().distanceSquared(player.getLocation())))
+                .orElse(null);
+    }
+
+    private Mob findAgentWithSavedJob(Player player, String name) {
+        return ownedAgents(player).stream()
+                .filter(v -> name.equalsIgnoreCase(agentName(v)))
+                .filter(v -> !getConfig().getString(jobPath(v) + ".kind", "").isBlank()
+                        && !getConfig().getString(jobPath(v) + ".status", "").isBlank())
+                .min(Comparator.<Mob, Boolean>comparing(v -> !activeJob(v))
+                        .thenComparingDouble(v -> v.getLocation().distanceSquared(player.getLocation())))
                 .orElse(null);
     }
 

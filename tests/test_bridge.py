@@ -2,7 +2,15 @@ import json
 import unittest
 from unittest.mock import patch
 
-from bridge.genecraft_bridge import extract_action, function_tools, make_plan, parse_sse_response, should_search_web, visible_models
+from bridge.genecraft_bridge import (
+    explicit_wood_gather_target,
+    extract_action,
+    function_tools,
+    make_plan,
+    parse_sse_response,
+    should_search_web,
+    visible_models,
+)
 
 
 class ResponsesStreamTests(unittest.TestCase):
@@ -100,6 +108,51 @@ class ResponsesStreamTests(unittest.TestCase):
         self.assertTrue(should_search_web("Build me a house based on a tutorial from the web"))
         self.assertTrue(should_search_web("look up an online guide for a starter home"))
         self.assertFalse(should_search_web("Collect 20 nearby logs"))
+
+    def test_clear_wood_orders_get_a_bounded_target(self):
+        self.assertEqual(explicit_wood_gather_target(
+            "gather 32 nearby tree logs for builder's house and save the plans in our shared supplies"
+        ), 32)
+        self.assertEqual(explicit_wood_gather_target("gather a stack of wood pls"), 64)
+        self.assertEqual(explicit_wood_gather_target("Could you please get some logs?"), 8)
+        self.assertEqual(explicit_wood_gather_target("gather wood"), 16)
+        self.assertIsNone(explicit_wood_gather_target("Explain how I could gather wood"))
+
+    def test_model_cannot_turn_an_explicit_wood_order_into_a_spoken_promise(self):
+        response = {"output": [{
+            "type": "function_call", "namespace": "minecraft", "name": "speak",
+            "arguments": '{"text":"On it. I will collect 32 logs."}',
+        }]}
+        with patch("bridge.genecraft_bridge.active_record", return_value={}), \
+             patch("bridge.genecraft_bridge.list_models", return_value=[{"slug": "test-model"}]), \
+             patch("bridge.genecraft_bridge.choose_model", return_value="test-model"), \
+             patch("bridge.genecraft_bridge.request_response", return_value=response):
+            result = make_plan({
+                "agent": "Woodcutter",
+                "prompt": "gather 32 nearby tree logs for builder's house",
+                "goal": "",
+                "context": {},
+            })
+        self.assertEqual(result, {
+            "action": "start_gather_wood", "arguments": {"target_logs": 32},
+        })
+
+    def test_active_wood_order_is_not_duplicated_by_the_fallback(self):
+        response = {"output": [{
+            "type": "function_call", "namespace": "minecraft", "name": "speak",
+            "arguments": '{"text":"I am already gathering."}',
+        }]}
+        with patch("bridge.genecraft_bridge.active_record", return_value={}), \
+             patch("bridge.genecraft_bridge.list_models", return_value=[{"slug": "test-model"}]), \
+             patch("bridge.genecraft_bridge.choose_model", return_value="test-model"), \
+             patch("bridge.genecraft_bridge.request_response", return_value=response):
+            result = make_plan({
+                "agent": "Woodcutter",
+                "prompt": "gather 32 nearby tree logs",
+                "goal": "",
+                "context": {"current_job": {"kind": "gather_wood", "status": "running", "target": 8}},
+            })
+        self.assertEqual(result["action"], "speak")
 
     def test_tutorial_orders_search_first_then_request_a_game_action(self):
         research = {"output": [
