@@ -128,7 +128,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         Player player = event.getPlayer();
         for (Mob agent : ownedAgents(player)) {
             if (!activeJob(agent)) continue;
-            agent.getPathfinder().stopPathfinding();
+            parkAgent(agent);
             changeJobStatus(null, agent, "waiting_for_owner", "");
         }
     }
@@ -454,6 +454,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 agent.setCustomName("§d" + name + " §7[GeneCraft]");
                 agent.setCustomNameVisible(true);
             }
+            if (!activeJob(agent) && !followTasks.containsKey(agent.getUniqueId())) parkAgent(agent);
         }
     }
 
@@ -488,7 +489,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 cancelFollow(agent.getUniqueId());
                 if (activeJob(agent)) cancelJob(player, agent, true);
                 else {
-                    agent.getPathfinder().stopPathfinding();
+                    parkAgent(agent);
                     agentSay(player, agentName(agent), "Stopped. I don’t have an active work order now.");
                 }
                 return;
@@ -669,6 +670,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             cat.setOwner(player);
         }
         agent.setPersistent(true);
+        agent.setAware(false);
         agent.getPersistentDataContainer().set(agentNameKey, PersistentDataType.STRING, name);
         agent.getPersistentDataContainer().set(agentOwnerKey, PersistentDataType.STRING, player.getUniqueId().toString());
         agent.getPersistentDataContainer().set(agentFormKey, PersistentDataType.STRING, form);
@@ -821,27 +823,39 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             return true;
         }
         String name = agentName(agent);
+        if (activeJob(agent)) {
+            player.sendMessage("§d[GeneCraft] §fCancel that agent's work order before starting a movement demo.");
+            return true;
+        }
         cancelFollow(agent.getUniqueId());
+        agent.setAware(true);
         player.sendMessage("§d[GeneCraft] §fRunning the model-free pathfinding demo with " + name + ".");
         agentSay(player, name, "I can navigate the world. Watch me visit a nearby point, then return to you.");
         Location destination = player.getLocation().clone().add(player.getLocation().getDirection().normalize().multiply(6.0));
         agent.getPathfinder().moveTo(destination, 1.0);
-        Bukkit.getScheduler().runTaskLater(this, () -> {
-            if (!agent.isValid()) return;
-            if (agent.getLocation().distanceSquared(destination) > 9.0) {
-                agent.getPathfinder().stopPathfinding();
-                agentSay(player, name, "That route was blocked, so I stopped safely.");
+        int[] phase = {0};
+        BukkitTask task = Bukkit.getScheduler().runTaskTimer(this, () -> {
+            if (!agent.isValid() || !player.isOnline() || !agent.getWorld().equals(player.getWorld())) {
+                cancelFollow(agent.getUniqueId());
+                if (agent.isValid()) parkAgent(agent);
                 return;
             }
-            agentSay(player, name, "Reached the nearby point. Returning to you now.");
-            agent.getPathfinder().moveTo(player.getLocation(), 1.0);
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                if (agent.isValid()) {
-                    agent.getPathfinder().stopPathfinding();
-                    agentSay(player, name, "Demo complete. You can ask me to speak, follow you, stop, or visit a saved waypoint.");
+            if (phase[0]++ == 0) {
+                if (agent.getLocation().distanceSquared(destination) > 9.0) {
+                    cancelFollow(agent.getUniqueId());
+                    parkAgent(agent);
+                    agentSay(player, name, "That route was blocked, so I stopped safely.");
+                    return;
                 }
-            }, 100L);
-        }, 100L);
+                agentSay(player, name, "Reached the nearby point. Returning to you now.");
+                agent.getPathfinder().moveTo(player.getLocation(), 1.0);
+            } else {
+                cancelFollow(agent.getUniqueId());
+                parkAgent(agent);
+                agentSay(player, name, "Demo complete. You can ask me to speak, follow you, stop, or visit a saved waypoint.");
+            }
+        }, 100L, 100L);
+        followTasks.put(agent.getUniqueId(), task);
         return true;
     }
 
@@ -930,7 +944,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             invalidatePendingPlan(agent);
             cancelFollow(agent.getUniqueId());
             cancelJob(player, agent, true);
-            agent.getPathfinder().stopPathfinding();
+            parkAgent(agent);
             player.sendMessage("§d[GeneCraft] §f" + agentName(agent) + " stopped.");
         }
         return true;
@@ -1132,6 +1146,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         // A raw Map serializes to YAML but cannot be read via dotted paths
         // until reload. Create a section so the scheduler sees this job now.
         getConfig().createSection(jobPath(agent), job);
+        agent.setAware(true);
         saveConfig();
         agentSay(player, agentName(agent), "On it. I’ll collect up to " + targetLogs
                 + " logs from trees within " + WOOD_SEARCH_RADIUS
@@ -1169,6 +1184,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         job.put("progress", 0);
         job.put("created_at", System.currentTimeMillis());
         getConfig().createSection(jobPath(agent), job);
+        agent.setAware(true);
         saveConfig();
         agentSay(player, agentName(agent), "I’ll cut a 1-wide, 2-high tunnel at Y=" + yLevel + " for " + length
                 + " blocks, following the direction you’re facing. I’ll stop at lava, water, or protected blocks.");
@@ -1177,7 +1193,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
     private void startHouseBuild(Player player, Mob agent, JsonArray blueprint, JsonArray sources) {
         if (!canStartJob(player, agent)) return;
         cancelFollow(agent.getUniqueId());
-        agent.getPathfinder().stopPathfinding();
+        parkAgent(agent);
         World world = agent.getWorld();
         Vector look = player.getLocation().getDirection();
         int fx = Math.abs(look.getX()) > Math.abs(look.getZ()) ? (look.getX() >= 0 ? 1 : -1) : 0;
@@ -1297,6 +1313,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             job.put("sources", sourceList);
         }
         getConfig().createSection(jobPath(agent), job);
+        agent.setAware(true);
         saveConfig();
         agentSay(player, agentName(agent), "I’ve made a " + placedBlocks.size()
                 + "-block starter-house plan. I’ll build it when our shared supplies contain the materials it needs.");
@@ -1380,7 +1397,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         if (refund) refundUnbuiltHouse(agent);
         getConfig().set(path + ".status", "cancelled");
         saveConfig();
-        agent.getPathfinder().stopPathfinding();
+        parkAgent(agent);
         if (player != null) agentSay(player, agentName(agent), "Work order cancelled. I’ve stopped safely.");
     }
 
@@ -1425,12 +1442,13 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 if (!activeJob(agent)) continue;
                 if (!agent.getWorld().equals(owner.getWorld())
                         || agent.getLocation().distance(owner.getLocation()) > PLAYER_ACTION_LIMIT) {
-                    agent.getPathfinder().stopPathfinding();
+                    parkAgent(agent);
                     changeJobStatus(owner, agent, "waiting_for_owner",
                             "I paused the work because you’re more than 32 blocks away. Come back nearby and I’ll resume.");
                     continue;
                 }
                 if (getConfig().getString(jobPath(agent) + ".status", "").equals("waiting_for_owner")) {
+                    agent.setAware(true);
                     changeJobStatus(owner, agent, "running", "You’re back nearby. I’m resuming the work.");
                 }
                 String kind = getConfig().getString(jobPath(agent) + ".kind", "");
@@ -1882,7 +1900,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             getConfig().set(jobPath(agent) + ".status", status);
             saveConfig();
         }
-        agent.getPathfinder().stopPathfinding();
+        parkAgent(agent);
         if (owner != null && owner.isOnline()) agentSay(owner, agentName(agent), message);
     }
 
@@ -1957,15 +1975,29 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                     player.sendMessage("§d[GeneCraft] §f" + name + " is busy with a saved work order. Cancel it before changing destinations.");
                 } else {
                     cancelFollow(agent.getUniqueId());
+                    agent.setAware(true);
                     boolean started = agent.getPathfinder().moveTo(destination, 1.0);
                     player.sendMessage(started ? "§d[GeneCraft] §f" + name + " is heading to '" + waypoint + "'."
                             : "§d[GeneCraft] §fI couldn't find a path to that waypoint.");
+                    if (started) {
+                        int[] seconds = {0};
+                        BukkitTask task = Bukkit.getScheduler().runTaskTimer(this, () -> {
+                            if (!agent.isValid()) { cancelFollow(agent.getUniqueId()); return; }
+                            if (!player.isOnline() || !agent.getWorld().equals(destination.getWorld())
+                                    || !agent.getPathfinder().hasPath() || ++seconds[0] >= 60
+                                    || agent.getLocation().distanceSquared(destination) <= 4.0) {
+                                cancelFollow(agent.getUniqueId());
+                                parkAgent(agent);
+                            }
+                        }, 20L, 20L);
+                        followTasks.put(agent.getUniqueId(), task);
+                    } else parkAgent(agent);
                 }
             }
             case "stop_moving" -> {
                 cancelFollow(agent.getUniqueId());
                 if (activeJob(agent)) cancelJob(player, agent, true);
-                agent.getPathfinder().stopPathfinding();
+                parkAgent(agent);
                 player.sendMessage("§b[GeneCraft] §f" + name + " stopped moving.");
             }
             case "remember" -> {
@@ -2282,20 +2314,22 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
     private void beginFollow(Player player, Mob agent) {
         UUID id = agent.getUniqueId();
         cancelFollow(id);
+        agent.setAware(true);
         int[] elapsedSeconds = {0};
         BukkitTask task = Bukkit.getScheduler().runTaskTimer(this, () -> {
             if (!player.isOnline() || !agent.isValid()) {
                 cancelFollow(id);
+                if (agent.isValid()) parkAgent(agent);
                 return;
             }
             if (!agent.getWorld().equals(player.getWorld()) || agent.getLocation().distance(player.getLocation()) > PLAYER_ACTION_LIMIT) {
-                agent.getPathfinder().stopPathfinding();
+                parkAgent(agent);
                 cancelFollow(id);
                 player.sendMessage("§d[GeneCraft] §f" + agentName(agent) + " stopped following because you left the 32-block demo area.");
                 return;
             }
             if (++elapsedSeconds[0] > 60) {
-                agent.getPathfinder().stopPathfinding();
+                parkAgent(agent);
                 cancelFollow(id);
                 player.sendMessage("§d[GeneCraft] §f" + agentName(agent) + " finished its 60-second follow window.");
                 return;
@@ -2313,6 +2347,13 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
     private void cancelFollow(UUID agentId) {
         BukkitTask task = followTasks.remove(agentId);
         if (task != null) task.cancel();
+    }
+
+    private void parkAgent(Mob agent) {
+        agent.getPathfinder().stopPathfinding();
+        // Keep normal physics and visibility, but stop vanilla wandering while
+        // this companion has no work. Explicit movement re-enables awareness.
+        agent.setAware(false);
     }
 
     private Mob findAgent(Player player, String name) {

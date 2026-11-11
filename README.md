@@ -81,7 +81,7 @@ Spawn two agents near oak trees and a flat clearing. These commands run locally 
 /genecraft supplies
 ```
 
-Stay within 32 blocks while Woodcutter works. Each harvested log becomes four planks in your shared supplies. Gathering looks for unstripped trunks near matching leaves; isolated beams and stripped wood are skipped. Unreachable targets are temporarily skipped so another tree can be tried. This is a tree heuristic, not protection for player claims.
+Stay within 32 blocks while Woodcutter works. Each harvested log becomes four planks in your shared supplies. Completed or cancelled workers stay at their work site until you give another movement or work order. Gathering looks for unstripped trunks near matching leaves; isolated beams and stripped wood are skipped. Unreachable targets are temporarily skipped so another tree can be tried. This is a tree heuristic, not protection for player claims.
 
 Face an empty, flat clearing and give Builder the next order:
 

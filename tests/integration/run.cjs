@@ -149,6 +149,7 @@ async function main() {
     assert.equal(block?.name, 'air', 'Harvested trunk must be absent in the actual world');
   }
   record('Job and entity survive restart; 24 real logs yield exactly 96 saved planks');
+  const woodcutterAtRest = Object.values(bot.entities).find(e => e.uuid === ids.Woodcutter).position.clone();
   await chat('/genecraft supplies withdraw OAK_PLANKS 8');
   await until('withdrawal inventory', () => bot.inventory.items().filter(i => i.name === 'oak_planks').reduce((n, i) => n + i.count, 0) === 8);
   assert.equal(supplies().OAK_PLANKS, 88);
@@ -172,6 +173,10 @@ async function main() {
   assert.equal(Math.min(...house.blocks.map(b => b.y)), 65, 'Floor rests directly on terrain');
   assert.equal(supplies().OAK_PLANKS, 2, 'House must consume exactly 86 saved planks');
   record('Builder consumes gathered supplies and completes a real grounded starter house');
+  const restingWoodcutter = Object.values(bot.entities).find(e => e.uuid === ids.Woodcutter);
+  assert(restingWoodcutter && restingWoodcutter.position.distanceTo(woodcutterAtRest) < 3,
+    'Completed worker must stay at its work site instead of wandering out of range');
+  record('Completed worker remains at its work site while another agent builds');
   await teleport(-12.5, 12.5);
   await spawnAgent('Miner');
   await consoleCommand('fill -13 65 15 -13 66 18 stone');
@@ -187,6 +192,7 @@ async function main() {
   assert.equal(bot.blockAt(new (require('vec3').Vec3)(-13, 65, 21))?.name, 'chest');
   record('Mining stops before protected containers');
   await teleport(0.5, 0.5);
+  await consoleCommand(`tp ${ids.Woodcutter} 8.5 65 -8.5`);
   const messageStart = messages.length;
   await chat('@Woodcutter gather 8 logs');
   await until('natural language creates saved job', () => work('Woodcutter')?.target === 8);
@@ -198,6 +204,11 @@ async function main() {
   await chat('@Woodcutter cancel job');
   await until('cancel recorded', () => work('Woodcutter')?.status === 'cancelled');
   record('Cancellation persists and stops scheduled work');
+  await chat('@Woodcutter follow me');
+  await until('idle worker resumes movement', () => Object.values(bot.entities)
+    .find(e => e.uuid === ids.Woodcutter)?.position.distanceTo(bot.entity.position) < 4);
+  await chat('@Woodcutter stop');
+  record('An idle worker can resume following on a new natural-language order');
   assert(!/Could not pass event|generated an exception|Error occurred while enabling/.test(allLogs), 'No plugin runtime errors across both server starts');
   await stop();
   fs.writeFileSync(path.join(dir, 'results.json'), JSON.stringify({ version, paper: '1.21.11-132', results }, null, 2));

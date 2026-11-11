@@ -8,6 +8,7 @@ Fixed a job-state bug that allowed an agent to promise work while the scheduler 
 - Added supply withdrawal into the player's real inventory, preserving items when inventory space is limited.
 - Fixed floating house foundations and added a visible total for building progress.
 - Improved gathering with blocked-route recovery and conservative trunk/canopy checks.
+- Completed and cancelled workers stay put instead of wandering beyond command range; new work and movement orders reactivate them.
 - Added mining checks for unsafe floors and vertical liquid neighbors.
 - Routed explicit natural-language orders locally in the bridge, without an account or model call. Open-ended requests still use the model. Local commands preserve unread agent messages.
 - Fixed status lookup across worlds.
