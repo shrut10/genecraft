@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      accept_minecraft_eula:
+        description: 'I have read and accept https://www.minecraft.net/eula (required for gameplay tests)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -38,3 +43,37 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Build Paper plugin
         run: mvn --batch-mode --no-transfer-progress verify
+
+  gameplay:
+    # Manual opt-in: running Minecraft requires the operator's EULA acceptance.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: tests/integration/package-lock.json
+      - run: mvn --batch-mode --no-transfer-progress verify
+      - run: npm ci --prefix tests/integration
+      - name: Run disposable-server gameplay tests
+        env:
+          MINECRAFT_EULA: ${{ inputs.accept_minecraft_eula }}
+        run: npm test --prefix tests/integration
+      - name: Upload server logs and results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: gameplay-evidence
+          path: |
+            /tmp/genecraft-integration-*/results.json
+            /tmp/genecraft-integration-*/failure.txt
+            /tmp/genecraft-integration-*/integration-server.log
+            /tmp/genecraft-integration-*/plugins/GeneCraft/config.yml

@@ -69,6 +69,34 @@ In Minecraft, run `/genecraft login` and use **Continue with ChatGPT** to review
 
 ## Play
 
+### A complete gameplay loop without an AI account
+
+Spawn two agents near oak trees and a flat clearing. These commands run locally on the server; the Python bridge and ChatGPT sign-in are optional:
+
+```text
+/genecraft spawn Woodcutter villager
+/genecraft spawn Builder villager
+/genecraft work Woodcutter gather 24
+/genecraft job Woodcutter status
+/genecraft supplies
+```
+
+Stay within 32 blocks while Woodcutter works. Each harvested log becomes four planks in your shared supplies. Gathering looks for unstripped trunks near matching leaves; isolated beams and stripped wood are skipped. Unreachable targets are temporarily skipped so another tree can be tried. This is a tree heuristic, not protection for player claims.
+
+Face an empty, flat clearing and give Builder the next order:
+
+```text
+/genecraft work Builder house starter
+/genecraft job Builder status
+/genecraft supplies withdraw OAK_PLANKS 8
+```
+
+The built-in starter cabin has a 5×5 floor, walls, roof and a working door. It uses 86 oak planks and waits if supplies are short. A 24-log oak run produces 96 planks, leaving ten after the build. Withdrawal puts available materials into your inventory; items that do not fit remain in shared supplies. The cabin is a fixed original blueprint; it needs no web tutorial or model call.
+
+For a tunnel, bring yourself and a third agent to the desired height, face the digging direction, then run `/genecraft work Miner mine 8` (or append an explicit Y level). Mining stops before containers, liquids or unsafe drops. `/genecraft job <name> cancel` cancels work and refunds unplaced reserved building materials. These are bounded sandbox workers: they do not yet manage tools, food, crafting recipes or survival progression.
+
+### Natural-language interaction
+
 Run these in Minecraft chat:
 
 ```text
@@ -93,6 +121,8 @@ Run these in Minecraft chat:
 
 Use `/genecraft help` for the complete command list. Skin profiles are resolved by the Paper server from the public Minecraft profile service. If profile lookup or mannequin display is unavailable on a server build, the plugin reports or falls back to its normal villager form. Player-style avatars use Paper's mannequin API with a pathfinding controller; the other forms use their native Minecraft entity types.
 
+With the bridge running, clear requests such as `@Woodcutter gather 24 logs`, `@Miner strip-mine 8 blocks at Y=12`, `@Gen follow me`, and `@Gen status` are interpreted locally without account sign-in or model usage. Open-ended conversation, planning and tutorial research still use the connected model. A local command leaves unread agent-to-agent messages in the inbox for a later model turn.
+
 Autonomous model calls can consume the connected account's usage. The loop is off by default. Set an explicit goal before enabling it; `/genecraft autonomy <name> off` stops it. `/genecraft goal <name> clear` removes the saved goal. The server stores goals, memories, and agent messages in the plugin's `config.yml` and carries them across restarts.
 
 For a strip mine, bring both yourself and the agent to the requested foot-level Y (for a classic run, Y=12) before giving the order. The tunnel follows the cardinal direction you face and stops at the first unsafe or protected slice. Wood and mined blocks are held in GeneCraft's shared supply store rather than dropped as items. A house waits if the shared store is short, then reserves its materials and builds over time. Use `/genecraft job <agent> cancel` or `@Agent stop` to cancel; unplaced house materials are returned. Server-side jobs work without client mods, but they do require a Paper server with the GeneCraft plugin.
@@ -108,6 +138,22 @@ python3 -m unittest discover -s tests -v
 ```
 
 The shaded plugin is created at `target/genecraft-paper-<version>.jar`. GitHub Actions builds and runs the bridge tests on Ubuntu, macOS, and Windows for pushes and pull requests.
+
+### Test gameplay without opening Minecraft
+
+The [headless acceptance runner](tests/integration/run.cjs) starts a real Paper 1.21.11 server and connects a [Mineflayer](https://github.com/PrismarineJS/mineflayer) simulated player. It creates a fresh temporary world on loopback port 25575, checks actual blocks, saved jobs and inventory, and shuts the server down afterwards. It never uses your existing world or account credentials.
+
+Install Node.js 22+ alongside the build requirements, build the JAR, and run:
+
+```sh
+npm ci --prefix tests/integration
+# Read https://www.minecraft.net/eula first; set this only if you accept it.
+MINECRAFT_EULA=true npm test --prefix tests/integration
+```
+
+In PowerShell, set `$env:MINECRAFT_EULA = 'true'` before `npm test --prefix tests/integration`. The runner downloads a pinned, checksum-verified Paper JAR (or accepts `GENECRAFT_TEST_PAPER` pointing to that exact JAR). Paper downloads its own server dependencies on first startup. Logs and results stay in the printed temporary directory for inspection. Offline authentication is enabled only in this disposable, loopback-bound test world.
+
+The suite covers gathering, owner-distance pauses, restart recovery, supply withdrawal, starter-house construction, mining, protected containers and cancellation. This verifies bounded gameplay; it does not evaluate live model reasoning, custom skins or every natural terrain layout. The **Build and test** GitHub workflow also offers these gameplay checks through a manual run with explicit EULA acceptance.
 
 ## Privacy and security
 

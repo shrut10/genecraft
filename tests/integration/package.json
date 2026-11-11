@@ -1,0 +1,9 @@
+{
+  "name": "genecraft-integration-tests",
+  "private": true,
+  "version": "0.4.0",
+  "description": "Real Paper server and simulated Minecraft player acceptance tests",
+  "scripts": { "test": "node run.cjs" },
+  "engines": { "node": ">=22" },
+  "dependencies": { "mineflayer": "4.39.0", "yaml": "2.9.1" }
+}

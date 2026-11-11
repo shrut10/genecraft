@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Prepare a private Paper demo folder on the user's external drive."""
+"""Prepare or upgrade a private Paper demo folder while its server is stopped."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
+import tempfile
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,8 +22,60 @@ DEMO_HOME = Path(os.environ.get(
     os.environ.get("FABLEORBIT_DEMO_HOME", str(Path.home() / "Minecraft" / "GeneCraft Demo")),
 )).expanduser()
 SERVER_DIR = DEMO_HOME / "server"
-PLUGIN_JAR = ROOT / "target" / "genecraft-paper-0.2.1.jar"
-USER_AGENT = "GeneCraft setup/0.2.1 (https://github.com/shrut10/genecraft)"
+
+
+def project_version(root: Path = ROOT) -> str:
+    version = ET.parse(root / "pom.xml").getroot().findtext("{http://maven.apache.org/POM/4.0.0}version", "")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", version):
+        raise RuntimeError("pom.xml must contain an explicit, valid GeneCraft project version.")
+    return version
+
+
+VERSION = project_version()
+PLUGIN_JAR = ROOT / "target" / f"genecraft-paper-{VERSION}.jar"
+USER_AGENT = f"GeneCraft setup/{VERSION} (https://github.com/shrut10/genecraft)"
+
+
+def plugin_metadata(jar: Path) -> dict[str, str]:
+    """Read only the simple identifying fields, without adding a YAML dependency."""
+    try:
+        with zipfile.ZipFile(jar) as archive:
+            text = archive.read("plugin.yml").decode("utf-8")
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return {}
+    return {key: value.strip().strip("\"'") for key, value in
+            re.findall(r"^(name|version):\s*([^\r\n]+)", text, re.MULTILINE)}
+
+
+def install_plugin(jar: Path, server_dir: Path, version: str = VERSION) -> Path:
+    if plugin_metadata(jar) != {"name": "GeneCraft", "version": version}:
+        raise RuntimeError("Plugin JAR metadata does not match the current GeneCraft version. Rebuild the plugin first.")
+    plugins = server_dir / "plugins"
+    plugins.mkdir(parents=True, exist_ok=True)
+    destination = plugins / jar.name
+    # Never replace an unrelated plugin just because someone renamed its file.
+    if destination.exists() and plugin_metadata(destination).get("name") != "GeneCraft":
+        raise RuntimeError(f"Refusing to replace an unrecognised plugin: {destination}")
+    previous = [path for path in plugins.glob("genecraft-paper-*.jar")
+                if path.is_file() and plugin_metadata(path).get("name") == "GeneCraft"]
+    backups = server_dir / "backups"
+    backups.mkdir(exist_ok=True)
+    backup_dir = Path(tempfile.mkdtemp(prefix="genecraft-plugin-", dir=backups))
+    # Stage outside plugins, so Paper cannot discover an incomplete/duplicate JAR.
+    staged = backup_dir / "new-plugin.tmp"
+    shutil.copy2(jar, staged)
+    moved: list[Path] = []
+    try:
+        for old in previous:
+            old.replace(backup_dir / old.name)
+            moved.append(old)
+        staged.replace(destination)
+    except OSError:
+        for old in moved:
+            (backup_dir / old.name).replace(old)
+        raise
+    print(f"Previous plugin JARs backed up in: {backup_dir}")
+    return destination
 
 
 def fetch_json(url: str) -> object:
@@ -29,6 +85,10 @@ def fetch_json(url: str) -> object:
 
 
 def download_paper() -> tuple[str, Path]:
+    target = SERVER_DIR / "paper.jar"
+    if target.exists():
+        print("Keeping the existing Paper server JAR; remove it manually only if you intend to upgrade the demo.")
+        return "existing", target
     builds = fetch_json(f"https://fill.papermc.io/v3/projects/paper/versions/{GAME_VERSION}/builds")
     if not isinstance(builds, list):
         raise RuntimeError("PaperMC did not return a build list for Minecraft " + GAME_VERSION)
@@ -36,10 +96,6 @@ def download_paper() -> tuple[str, Path]:
     if not stable:
         raise RuntimeError("No stable Paper build is available for Minecraft " + GAME_VERSION)
     download = stable["downloads"]["server:default"]
-    target = SERVER_DIR / "paper.jar"
-    if target.exists():
-        print("Keeping the existing Paper server JAR; remove it manually only if you intend to upgrade the demo.")
-        return str(stable["id"]), target
     temp = SERVER_DIR / "paper.jar.download"
     request = urllib.request.Request(download["url"], headers={"User-Agent": USER_AGENT})
     digest = hashlib.sha256()
@@ -67,10 +123,8 @@ def main() -> None:
         raise RuntimeError("Build the plugin first using scripts/build-plugin.sh.")
     SERVER_DIR.mkdir(parents=True, exist_ok=True)
     (DEMO_HOME / "client-game").mkdir(parents=True, exist_ok=True)
-    plugins = SERVER_DIR / "plugins"
-    plugins.mkdir(exist_ok=True)
-    shutil.copy2(PLUGIN_JAR, plugins / PLUGIN_JAR.name)
     build, paper_jar = download_paper()
+    installed = install_plugin(PLUGIN_JAR, SERVER_DIR)
     write_once(SERVER_DIR / "eula.txt", "# Review https://www.minecraft.net/eula before accepting.\neula=false\n")
     properties = """# Private local GeneCraft sandbox: server binds to this device only.
 motd=GeneCraft local demo
@@ -99,11 +153,11 @@ level-name=world
         )
         launcher.chmod(0o755)
     print(f"Demo directory: {DEMO_HOME}")
-    print(f"Paper: Minecraft {GAME_VERSION}, stable build {build} ({paper_jar.stat().st_size:,} bytes)")
-    print(f"Plugin installed: {plugins / PLUGIN_JAR.name}")
+    print(f"Paper: Minecraft {GAME_VERSION}, build {build} ({paper_jar.stat().st_size:,} bytes)")
+    print(f"Plugin installed: {installed}")
     print(f"Client game directory to select in Minecraft Launcher: {DEMO_HOME / 'client-game'}")
     print(f"Server start file: {launcher}")
-    print("The server EULA was left at eula=false. Read it and accept it yourself before starting the server.")
+    print("Existing world, settings and EULA choice were preserved. A new server starts with eula=false; read and accept the EULA before starting it.")
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.entity.Villager;
 import org.bukkit.entity.Wolf;
 import org.bukkit.entity.EntityType;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -96,6 +97,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
     private final Set<UUID> invalidatedPlans = ConcurrentHashMap.newKeySet();
     private final Map<UUID, BukkitTask> followTasks = new ConcurrentHashMap<>();
     private final Map<UUID, Set<String>> pendingInboxSnapshots = new ConcurrentHashMap<>();
+    private final Map<UUID, Map<String, Long>> unreachableLogs = new HashMap<>();
     private int guardPulse = 0;
 
     @Override
@@ -168,8 +170,11 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         if (subcommand.equals("job")) {
             return jobCommand(sender, args);
         }
+        if (subcommand.equals("work")) {
+            return workCommand(sender, args);
+        }
         if (subcommand.equals("supplies")) {
-            return supplies(sender);
+            return supplies(sender, args);
         }
         if (subcommand.equals("inbox")) {
             return inbox(sender, args);
@@ -898,8 +903,13 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 if (!autonomous) player.sendMessage("§b[GeneCraft] §fThe agent is no longer in the world, so I discarded the action.");
                 return;
             }
-            consumeInboxSnapshot(liveAgent, capturedInbox == null ? Set.of() : capturedInbox);
-            if (!autonomous) sendChatGptPlanMessage(player, false);
+            boolean localPlan = result.has("planner") && result.get("planner").getAsString().equals("local");
+            // Local command routing never reads the inbox. Preserve those messages
+            // until an AI planning turn actually receives and processes them.
+            if (!localPlan) {
+                consumeInboxSnapshot(liveAgent, capturedInbox == null ? Set.of() : capturedInbox);
+                if (!autonomous) sendChatGptPlanMessage(player, false);
+            }
             executePlan(player, liveAgent, result);
         }));
     }
@@ -964,9 +974,99 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         return true;
     }
 
-    private boolean supplies(CommandSender sender) {
+    private boolean workCommand(CommandSender sender, String[] args) {
         if (!(sender instanceof Player player)) {
             sender.sendMessage("Run this command in the game as a player.");
+            return true;
+        }
+        if (args.length < 4) {
+            player.sendMessage("Use /genecraft work <agent> gather <1-64>, mine <4-32> [Y], or house starter.");
+            return true;
+        }
+        Mob agent = findAgent(player, args[1]);
+        if (agent == null) {
+            player.sendMessage("§d[GeneCraft] §fI can't find that agent nearby.");
+            return true;
+        }
+        if (pendingPlans.contains(agent.getUniqueId())) {
+            player.sendMessage("§d[GeneCraft] §fThat agent is still planning. Stop it first before replacing its request.");
+            return true;
+        }
+        try {
+            switch (args[2].toLowerCase(Locale.ROOT)) {
+                case "gather" -> {
+                    int count = Integer.parseInt(args[3]);
+                    if (count < 1 || count > 64) throw new IllegalArgumentException();
+                    startGatherWood(player, agent, count);
+                }
+                case "mine" -> {
+                    int length = Integer.parseInt(args[3]);
+                    int y = args.length > 4 ? Integer.parseInt(args[4]) : player.getLocation().getBlockY();
+                    if (length < 4 || length > 32 || y < player.getWorld().getMinHeight() + 1
+                            || y + 1 >= player.getWorld().getMaxHeight()) throw new IllegalArgumentException();
+                    startStripMine(player, agent, length, y);
+                }
+                case "house" -> {
+                    if (!args[3].equalsIgnoreCase("starter")) throw new IllegalArgumentException();
+                    player.sendMessage("§b[GeneCraft] §fThe starter house uses 86 oak planks (22 oak logs). It has a 5×5 floor, walls, roof and a working door.");
+                    startHouseBuild(player, agent, starterHouse(), new JsonArray());
+                }
+                default -> throw new IllegalArgumentException();
+            }
+        } catch (IllegalArgumentException exception) {
+            player.sendMessage("Use /genecraft work <agent> gather <1-64>, mine <4-32> [Y], or house starter.");
+        }
+        return true;
+    }
+
+    private JsonArray starterHouse() {
+        JsonArray plan = new JsonArray();
+        for (int y = 0; y <= 3; y++) {
+            for (int x = 0; x < 5; x++) {
+                for (int z = 0; z < 5; z++) {
+                    if (y != 0 && y != 3 && x != 0 && x != 4 && z != 0 && z != 4) continue;
+                    if (x == 2 && z == 0 && y == 2) continue;
+                    JsonObject block = new JsonObject();
+                    block.addProperty("x", x);
+                    block.addProperty("y", y);
+                    block.addProperty("z", z);
+                    block.addProperty("material", x == 2 && z == 0 && y == 1 ? "OAK_DOOR" : "OAK_PLANKS");
+                    plan.add(block);
+                }
+            }
+        }
+        return plan;
+    }
+
+    private boolean supplies(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("Run this command in the game as a player.");
+            return true;
+        }
+        if (args.length > 1) {
+            if (args.length != 4 || !args[1].equalsIgnoreCase("withdraw")) {
+                player.sendMessage("Use /genecraft supplies withdraw <material> <1-64>.");
+                return true;
+            }
+            Material material = Material.matchMaterial(args[2]);
+            int requested;
+            try { requested = Integer.parseInt(args[3]); }
+            catch (NumberFormatException exception) { requested = 0; }
+            if (material == null || !material.isItem() || requested < 1 || requested > 64) {
+                player.sendMessage("Choose an item material and a count from 1 to 64.");
+                return true;
+            }
+            int available = Math.min(requested, supplyCount(player.getUniqueId(), material));
+            if (available == 0) {
+                player.sendMessage("§d[GeneCraft] §fThere are none of those items in your shared supplies.");
+                return true;
+            }
+            Map<Integer, ItemStack> leftover = player.getInventory().addItem(new ItemStack(material, available));
+            int inserted = available - leftover.values().stream().mapToInt(ItemStack::getAmount).sum();
+            adjustSupply(player.getUniqueId(), material, -inserted);
+            saveConfig();
+            player.sendMessage("§d[GeneCraft] §fWithdrew " + inserted + " " + material.name().toLowerCase(Locale.ROOT)
+                    + ". Any items that did not fit remain in shared supplies.");
             return true;
         }
         var section = getConfig().getConfigurationSection(ownerSupplyPath(player.getUniqueId()));
@@ -1014,6 +1114,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
 
     private void startGatherWood(Player player, Mob agent, int targetLogs) {
         if (!canStartJob(player, agent)) return;
+        unreachableLogs.remove(agent.getUniqueId());
         cancelFollow(agent.getUniqueId());
         agent.getPathfinder().stopPathfinding();
         Map<String, Object> job = new java.util.LinkedHashMap<>();
@@ -1028,7 +1129,9 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         job.put("target", targetLogs);
         job.put("progress", 0);
         job.put("created_at", System.currentTimeMillis());
-        getConfig().set(jobPath(agent), job);
+        // A raw Map serializes to YAML but cannot be read via dotted paths
+        // until reload. Create a section so the scheduler sees this job now.
+        getConfig().createSection(jobPath(agent), job);
         saveConfig();
         agentSay(player, agentName(agent), "On it. I’ll collect up to " + targetLogs
                 + " logs from trees within " + WOOD_SEARCH_RADIUS
@@ -1065,7 +1168,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         job.put("length", length);
         job.put("progress", 0);
         job.put("created_at", System.currentTimeMillis());
-        getConfig().set(jobPath(agent), job);
+        getConfig().createSection(jobPath(agent), job);
         saveConfig();
         agentSay(player, agentName(agent), "I’ll cut a 1-wide, 2-high tunnel at Y=" + yLevel + " for " + length
                 + " blocks, following the direction you’re facing. I’ll stop at lava, water, or protected blocks.");
@@ -1179,6 +1282,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         job.put("worker_z", centerZ - fz + 0.5);
         job.put("door_facing", doorFacing.name());
         job.put("blocks", placedBlocks);
+        job.put("target", placedBlocks.size());
         job.put("progress", 0);
         job.put("created_at", System.currentTimeMillis());
         if (sources != null && !sources.isEmpty()) {
@@ -1192,7 +1296,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             }
             job.put("sources", sourceList);
         }
-        getConfig().set(jobPath(agent), job);
+        getConfig().createSection(jobPath(agent), job);
         saveConfig();
         agentSay(player, agentName(agent), "I’ve made a " + placedBlocks.size()
                 + "-block starter-house plan. I’ll build it when our shared supplies contain the materials it needs.");
@@ -1211,7 +1315,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             Material material = world.getBlockAt(x, y, z).getType();
             String name = material.name();
             if (!material.isSolid() || isTreeLog(material) || name.endsWith("_LEAVES") || name.equals("VINE")) continue;
-            return y + 1;
+            return y;
         }
         return world.getMinHeight();
     }
@@ -1393,6 +1497,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             }
         }
         if (approach == null) {
+            skipLogTemporarily(agent, log);
             clearGatherTarget(path);
             getConfig().set(path + ".next_search_at", System.currentTimeMillis() + WOOD_RESCAN_DELAY_MS);
             saveConfig();
@@ -1401,6 +1506,21 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         }
         if (agent.getLocation().distance(approach) > 2.8) {
             var pathfinder = agent.getPathfinder();
+            Location here = agent.getLocation();
+            long lastMovedAt = getConfig().getLong(path + ".last_moved_at", 0L);
+            double moved = Math.pow(here.getX() - getConfig().getDouble(path + ".last_x", here.getX()), 2)
+                    + Math.pow(here.getZ() - getConfig().getDouble(path + ".last_z", here.getZ()), 2);
+            if (lastMovedAt == 0 || moved > 0.25) {
+                getConfig().set(path + ".last_moved_at", System.currentTimeMillis());
+                getConfig().set(path + ".last_x", here.getX());
+                getConfig().set(path + ".last_z", here.getZ());
+            } else if (System.currentTimeMillis() - lastMovedAt > 12000) {
+                pathfinder.stopPathfinding();
+                skipLogTemporarily(agent, log);
+                clearGatherTarget(path);
+                changeJobStatus(owner, agent, "waiting_for_logs", "That route is blocked. I’m looking for another reachable tree.");
+                return;
+            }
             boolean alreadyHeadingThere = pathfinder.hasPath()
                     && getConfig().getInt(path + ".route_x", Integer.MIN_VALUE) == approach.getBlockX()
                     && getConfig().getInt(path + ".route_y", Integer.MIN_VALUE) == approach.getBlockY()
@@ -1410,6 +1530,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             // reaches its destination or actually fails.
             if (!alreadyHeadingThere) {
                 if (!pathfinder.moveTo(approach, 1.0)) {
+                    skipLogTemporarily(agent, log);
                     clearGatherTarget(path);
                     getConfig().set(path + ".next_search_at", System.currentTimeMillis() + WOOD_RESCAN_DELAY_MS);
                     saveConfig();
@@ -1431,6 +1552,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             return;
         }
         Location soundAt = log.getLocation();
+        agent.swingMainHand();
         log.setType(Material.AIR, false);
         world.playSound(soundAt, org.bukkit.Sound.BLOCK_WOOD_BREAK, 0.8f, 1.0f);
         adjustSupply(owner.getUniqueId(), plank, 4);
@@ -1443,9 +1565,18 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
     }
 
     private void clearGatherTarget(String path) {
-        for (String key : List.of("target_x", "target_y", "target_z", "approach_x", "approach_y", "approach_z", "route_x", "route_y", "route_z")) {
+        for (String key : List.of("target_x", "target_y", "target_z", "approach_x", "approach_y", "approach_z", "route_x", "route_y", "route_z", "last_moved_at", "last_x", "last_z")) {
             getConfig().set(path + "." + key, null);
         }
+    }
+
+    private String logKey(Block log) {
+        return log.getWorld().getName() + ":" + log.getX() + "," + log.getY() + "," + log.getZ();
+    }
+
+    private void skipLogTemporarily(Mob agent, Block log) {
+        unreachableLogs.computeIfAbsent(agent.getUniqueId(), ignored -> new HashMap<>())
+                .put(logKey(log), System.currentTimeMillis() + 60000L);
     }
 
     private Location savedLogApproach(String path, World world, Block log) {
@@ -1475,6 +1606,8 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         int radiusSquared = WOOD_SEARCH_RADIUS * WOOD_SEARCH_RADIUS;
         Block best = null;
         double bestDistance = Double.MAX_VALUE;
+        Map<String, Long> skipped = unreachableLogs.computeIfAbsent(agent.getUniqueId(), ignored -> new HashMap<>());
+        skipped.values().removeIf(expiry -> expiry < System.currentTimeMillis());
         for (int x = anchorX - WOOD_SEARCH_RADIUS; x <= anchorX + WOOD_SEARCH_RADIUS; x++) {
             for (int z = anchorZ - WOOD_SEARCH_RADIUS; z <= anchorZ + WOOD_SEARCH_RADIUS; z++) {
                 int dx = x - anchorX;
@@ -1484,8 +1617,9 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 for (int y = Math.max(world.getMinHeight(), anchorY - 16); y <= Math.min(world.getMaxHeight() - 1, anchorY + 24); y++) {
                     Block block = world.getBlockAt(x, y, z);
                     if (!isTreeLog(block.getType())) continue;
+                    if (skipped.containsKey(logKey(block))) continue;
                     double distance = block.getLocation().distanceSquared(agent.getLocation());
-                    if (distance < bestDistance) {
+                    if (distance < bestDistance && hasTreeCanopy(block)) {
                         best = block;
                         bestDistance = distance;
                     }
@@ -1493,6 +1627,27 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             }
         }
         return best;
+    }
+
+    private boolean hasTreeCanopy(Block log) {
+        // A conservative tree heuristic: do not harvest stripped/decorative wood
+        // or isolated house beams. This is not a replacement for claim plugins.
+        String root = log.getType().name().replace("_LOG", "").replace("_STEM", "");
+        Material canopy = Material.matchMaterial(root + "_LEAVES");
+        if (root.equals("CRIMSON")) canopy = Material.NETHER_WART_BLOCK;
+        if (root.equals("WARPED")) canopy = Material.WARPED_WART_BLOCK;
+        if (canopy == null) return false;
+        World world = log.getWorld();
+        for (int x = log.getX() - 2; x <= log.getX() + 2; x++) {
+            for (int z = log.getZ() - 2; z <= log.getZ() + 2; z++) {
+                if (!world.isChunkLoaded(x >> 4, z >> 4)) continue;
+                for (int y = Math.max(world.getMinHeight(), log.getY() - 2);
+                     y <= Math.min(world.getMaxHeight() - 1, log.getY() + 8); y++) {
+                    if (world.getBlockAt(x, y, z).getType() == canopy) return true;
+                }
+            }
+        }
+        return false;
     }
 
     private Location findLogApproach(Mob agent, Block log) {
@@ -1504,8 +1659,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
             int x = log.getX() + offset[0];
             int z = log.getZ() + offset[1];
             if (!world.isChunkLoaded(x >> 4, z >> 4)) continue;
-            int surfaceY = world.getHighestBlockYAt(x, z);
-            for (int y = Math.max(world.getMinHeight() + 1, surfaceY - 24); y <= Math.min(world.getMaxHeight() - 2, surfaceY + 1); y++) {
+            for (int y = Math.max(world.getMinHeight() + 1, log.getY() - 6); y <= Math.min(world.getMaxHeight() - 2, log.getY()); y++) {
                 if (!isStandable(world, x, y, z)) continue;
                 Location candidate = new Location(world, x + 0.5, y, z + 0.5);
                 double distance = candidate.distanceSquared(agent.getLocation());
@@ -1520,8 +1674,7 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
 
     private boolean isTreeLog(Material material) {
         String name = material.name();
-        return name.endsWith("_LOG") || name.endsWith("_WOOD") || name.endsWith("_STEM")
-                || name.endsWith("_HYPHAE") || name.equals("BAMBOO_BLOCK");
+        return !name.startsWith("STRIPPED_") && (name.endsWith("_LOG") || name.endsWith("_STEM"));
     }
 
     private Material planksForLog(Material log) {
@@ -1569,6 +1722,11 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         }
         Block lower = world.getBlockAt(x, y, z);
         Block upper = world.getBlockAt(x, y + 1, z);
+        Block floor = world.getBlockAt(x, y - 1, z);
+        if (floor.isPassable() || floor.isLiquid()) {
+            finishJob(owner, agent, "stopped_safe", "There is no safe floor ahead, so I stopped before entering a drop.");
+            return;
+        }
         if (!isSafeTunnelSlice(lower, world, x, y, z) || !isSafeTunnelSlice(upper, world, x, y + 1, z)) {
             finishJob(owner, agent, "stopped_safe", "I reached lava, water, or a protected block, so I stopped this tunnel safely.");
             return;
@@ -1591,7 +1749,6 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
 
     private boolean isSafeTunnelSlice(Block block, World world, int x, int y, int z) {
         Material material = block.getType();
-        if (material.isAir()) return true;
         if (block.isLiquid() || material == Material.BEDROCK || material == Material.BARRIER
                 || material == Material.END_PORTAL || material == Material.END_PORTAL_FRAME
                 || material == Material.NETHER_PORTAL || material == Material.STRUCTURE_VOID
@@ -1602,11 +1759,12 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 "GRANITE", "DIORITE", "ANDESITE", "DIRT", "ROOTED_DIRT", "GRAVEL", "SAND", "RED_SAND", "CLAY",
                 "NETHERRACK", "BLACKSTONE", "BASALT", "SOUL_SAND", "SOUL_SOIL", "COBBLESTONE").contains(name)
                 || name.endsWith("_ORE") || name.equals("ANCIENT_DEBRIS");
-        if (!natural) return false;
-        int[][] sides = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        if (!natural && !material.isAir()) return false;
+        int[][] sides = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, -1, 0}};
         for (int[] side : sides) {
-            if (!world.isChunkLoaded((x + side[0]) >> 4, (z + side[1]) >> 4)) continue;
-            Material neighbor = world.getBlockAt(x + side[0], y, z + side[1]).getType();
+            if (!world.isChunkLoaded((x + side[0]) >> 4, (z + side[2]) >> 4)) return false;
+            if (y + side[1] < world.getMinHeight() || y + side[1] >= world.getMaxHeight()) return false;
+            Material neighbor = world.getBlockAt(x + side[0], y + side[1], z + side[2]).getType();
             if (neighbor == Material.LAVA || neighbor == Material.WATER) return false;
         }
         return true;
@@ -2168,7 +2326,8 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 // the nearest idle copy. This keeps /job status/cancel and
                 // natural-language requests aligned with the active worker.
                 .min(Comparator.<Mob, Boolean>comparing(v -> !activeJob(v))
-                        .thenComparingDouble(v -> v.getLocation().distanceSquared(player.getLocation())))
+                        .thenComparingDouble(v -> v.getWorld().equals(player.getWorld())
+                                ? v.getLocation().distanceSquared(player.getLocation()) : Double.MAX_VALUE))
                 .orElse(null);
     }
 
@@ -2178,7 +2337,8 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
                 .filter(v -> !getConfig().getString(jobPath(v) + ".kind", "").isBlank()
                         && !getConfig().getString(jobPath(v) + ".status", "").isBlank())
                 .min(Comparator.<Mob, Boolean>comparing(v -> !activeJob(v))
-                        .thenComparingDouble(v -> v.getLocation().distanceSquared(player.getLocation())))
+                        .thenComparingDouble(v -> v.getWorld().equals(player.getWorld())
+                                ? v.getLocation().distanceSquared(player.getLocation()) : Double.MAX_VALUE))
                 .orElse(null);
     }
 
@@ -2359,7 +2519,9 @@ public final class GeneCraftPlugin extends JavaPlugin implements CommandExecutor
         sender.sendMessage("§f@<agent> <message> §7chat naturally and give direct orders");
         sender.sendMessage("§f/genecraft ask <name> <request> §7ask the GPT agent to act");
         sender.sendMessage("§f/genecraft job <name> status|cancel §7check or cancel saved work");
+        sender.sendMessage("§f/genecraft work <name> gather <count> | mine <length> [Y] | house starter §7work without AI");
         sender.sendMessage("§f/genecraft supplies §7view shared agent materials");
+        sender.sendMessage("§f/genecraft supplies withdraw <material> <count> §7take up to 64 items into your inventory");
         sender.sendMessage("§f/genecraft stop <name> §7stop movement and cancel its work");
         sender.sendMessage("§f/genecraft remove <name> §7remove an agent and saved state");
         sender.sendMessage("§f/genecraft goal <name> set <goal> §7save a persistent goal");

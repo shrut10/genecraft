@@ -248,27 +248,51 @@ def should_search_web(prompt: str) -> bool:
     return re.search(r"\b(tutorial|from the web|online guide|look up|search online)\b", prompt, re.IGNORECASE) is not None
 
 
-def explicit_wood_gather_target(prompt: str) -> int | None:
-    """Recognize clear wood work orders so the model cannot turn them into empty promises."""
+def direct_order_text(prompt: str) -> str | None:
+    """Strip only explicit addressing/politeness, never arbitrary leading words.
+
+    Ambiguous, quoted, conditional, and negative requests stay on the model path.
+    In particular, 'never gather wood' must not treat 'never' as an agent name.
+    """
     text = re.sub(r"\s+", " ", prompt).strip().lower()
-    if not text or not re.search(r"\b(?:wood|logs?|tree trunks?|planks?)\b", text):
+    if not text or re.search(r'["“”`]', text):
         return None
-    order = re.match(
-        r"^(?:@?[a-z0-9_-]{1,24}[,:]?\s+)?(?:hey\s+)?(?:please\s+)?"
-        r"(?:(?:can|could|would|will)\s+you\s+|i need you to\s+|i want you to\s+|go\s+(?:and\s+)?)?"
-        r"(?:please\s+|just\s+)?(?:gather|collect|chop|cut|harvest|fetch|bring|get)\b",
-        text,
+    # Only @ explicitly marks an addressee. A bare prefix such as
+    # 'Example: gather wood' must not become an executable work order.
+    text = re.sub(r"^@[a-z0-9_-]{1,24}[,:]?\s+", "", text)
+    text = re.sub(r"^(?:hey\s+)?(?:please\s+)?", "", text)
+    text = re.sub(r"^(?:(?:can|could|would|will) you |i (?:need|want) you to |go (?:and )?)", "", text)
+    text = re.sub(r"^(?:please|just)\s+", "", text)
+    text = re.sub(r"(?:\s+(?:please|pls))?[.!?]*$", "", text).strip()
+    if (re.search(r"\b(?:not|never|don['’]?t|stop|avoid|unless|if|instead|without)\b", text)
+            and text not in {"stop", "stop moving", "stop working"}):
+        return None
+    return text
+
+
+def explicit_wood_gather_target(prompt: str) -> int | None:
+    """Recognize an explicit wood quantity, not numbers in a purpose/location."""
+    text = direct_order_text(prompt)
+    if text is None:
+        return None
+    order = re.fullmatch(
+        r"(?:gather|collect|chop|cut|harvest|fetch|bring|get)\s+"
+        r"(?P<quantity>-?\d+|a full stack of|a stack of|a stack|some|a few|a little)?\s*"
+        r"(?:nearby |tree |oak |birch |spruce |jungle |acacia |dark oak |cherry |mangrove |pale oak )*"
+        r"(?:wood|logs?|trunks?)"
+        r"(?:\s+(?:for|into|from|and (?:save|store|put|add))\s+[^.!?]+)?", text,
     )
     if not order:
         return None
-    count_match = re.search(r"\b(\d{1,3})\b", text)
-    if count_match:
-        return min(64, max(1, int(count_match.group(1))))
-    if re.search(r"\b(?:a\s+)?(?:full\s+)?stack\b", text):
+    quantity = order.group("quantity") or ""
+    if re.fullmatch(r"-?\d+", quantity):
+        count = int(quantity)
+        if not 1 <= count <= 64:
+            raise ValueError("Ask for between 1 and 64 logs per wood-gathering job.")
+        return count
+    if "stack" in quantity:
         return 64
-    if re.search(r"\b(?:a\s+few|some|a\s+little)\b", text):
-        return 8
-    return 16
+    return 8 if quantity else 16
 
 
 def has_active_job(context: Any) -> bool:
@@ -279,6 +303,58 @@ def has_active_job(context: Any) -> bool:
         return False
     status = str(job.get("status", "")).lower()
     return status == "running" or status.startswith("waiting_")
+
+
+def local_order_plan(prompt: str, context: Any) -> dict[str, Any] | None:
+    """Reliable, token-free routing for a deliberately small command vocabulary.
+
+    These are the same bounded actions as model plans; the server remains the
+    authority for range, ownership, inventories, pathfinding, and world changes.
+    """
+    text = direct_order_text(prompt)
+    if text is None:
+        return None
+    action: str
+    arguments: dict[str, Any] = {}
+    if text in {"stop", "stop moving", "stop working"}:
+        action = "stop_moving"
+    elif text in {"cancel", "cancel job", "cancel the job", "cancel your job"}:
+        action = "cancel_job"
+    elif text in {"follow me", "come with me"}:
+        action = "follow_player"
+    elif text in {"status", "job status", "progress", "how is the job going", "what is your progress"}:
+        job = context.get("current_job") if isinstance(context, dict) else None
+        if not isinstance(job, dict) or not job.get("kind"):
+            message = "I have no saved work order. Ask me to gather logs or start a strip mine."
+        else:
+            kind = str(job.get("kind", "work")).replace("_", " ")[:30]
+            status = str(job.get("status", "unknown")).replace("_", " ")[:30]
+            progress = job.get("progress", 0)
+            target = job.get("target", job.get("length", "?"))
+            message = f"Saved job: {kind}; {status}; progress {progress}/{target}."
+        action, arguments = "speak", {"text": message[:160]}
+    else:
+        target = explicit_wood_gather_target(prompt)
+        mining = re.fullmatch(
+            r"(?:strip[- ]mine|mine(?: a tunnel)?)\s+(-?\d+)\s+blocks?"
+            r"(?:\s+at\s+y\s*=?\s*(-?\d+))?", text,
+        )
+        if target is not None:
+            action, arguments = "start_gather_wood", {"target_logs": target}
+        elif mining:
+            length = int(mining.group(1))
+            y = int(mining.group(2)) if mining.group(2) is not None else (
+                context.get("player_y_level") if isinstance(context, dict) else None)
+            if not 4 <= length <= 32:
+                raise ValueError("Ask for between 4 and 32 tunnel blocks per mining job.")
+            if type(y) is not int or not -60 <= y <= 319:
+                raise ValueError("Specify a mining level between Y=-60 and Y=319, and bring the agent to that level.")
+            action, arguments = "start_strip_mine", {"length": length, "y_level": y, "direction": "player_facing"}
+        else:
+            return None
+        if has_active_job(context):
+            action, arguments = "speak", {"text": "I already have an active work order. Ask for status, or cancel it before assigning another job."}
+    return {"action": action, "arguments": arguments, "planner": "local"}
 
 
 def function_tools() -> list[dict[str, Any]]:
@@ -581,11 +657,14 @@ def request_response(model: str, instructions: str, content: str, tools: list[di
 
 
 def make_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    context = payload.get("context", {})
+    user_prompt = str(payload.get("prompt", ""))[:1000]
+    local = local_order_plan(user_prompt, context)
+    if local is not None:
+        return local
     record = active_record()
     models = list_models(record)
     model = choose_model(models)
-    context = payload.get("context", {})
-    user_prompt = str(payload.get("prompt", ""))[:1000]
     plan_input: dict[str, Any] = {
         "agent": str(payload.get("agent", "agent"))[:24],
         "player_request": user_prompt,
@@ -619,12 +698,6 @@ def make_plan(payload: dict[str, Any]) -> dict[str, Any]:
         function_tools(),
     )
     action = extract_action(response)
-    # A spoken promise looked like a successful gather order but left no saved
-    # game job. Route clear wood orders deterministically if the model fails to
-    # choose the work-order action. Never start a duplicate active job.
-    target_logs = explicit_wood_gather_target(user_prompt)
-    if target_logs is not None and not has_active_job(context):
-        action = {"action": "start_gather_wood", "arguments": {"target_logs": target_logs}}
     if sources:
         combined = action.get("sources", [])
         for source in sources:

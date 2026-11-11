@@ -2,6 +2,8 @@
 /target/
 /.venv/
 /runtime/
+node_modules/
+/tests/integration/.runtime/
 __pycache__/
 *.py[cod]
 .pytest_cache/

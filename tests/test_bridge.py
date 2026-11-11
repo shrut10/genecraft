@@ -6,6 +6,7 @@ from bridge.genecraft_bridge import (
     explicit_wood_gather_target,
     extract_action,
     function_tools,
+    local_order_plan,
     make_plan,
     parse_sse_response,
     should_search_web,
@@ -134,8 +135,76 @@ class ResponsesStreamTests(unittest.TestCase):
                 "context": {},
             })
         self.assertEqual(result, {
-            "action": "start_gather_wood", "arguments": {"target_logs": 32},
+            "action": "start_gather_wood", "arguments": {"target_logs": 32}, "planner": "local",
         })
+
+    def test_clear_orders_work_without_account_or_model_network_calls(self):
+        with patch("bridge.genecraft_bridge.active_record", side_effect=AssertionError("account accessed")), \
+             patch("bridge.genecraft_bridge.request_response", side_effect=AssertionError("model called")):
+            cases = [
+                ("gather 8 logs", "start_gather_wood"),
+                ("@Woodcutter, please follow me", "follow_player"),
+                ("@Woodcutter stop", "stop_moving"),
+                ("cancel the job", "cancel_job"),
+                ("strip-mine 8 blocks at Y=12", "start_strip_mine"),
+                ("status", "speak"),
+            ]
+            for prompt, action in cases:
+                with self.subTest(prompt=prompt):
+                    result = make_plan({"prompt": prompt, "context": {}})
+                    self.assertEqual(result["action"], action)
+                    self.assertEqual(result["planner"], "local")
+
+    def test_local_router_preserves_ambiguous_negated_and_quoted_requests(self):
+        prompts = [
+            "never gather wood", "don't gather wood", "do not gather wood",
+            "gather logs only if we need them", 'Say "gather wood"', "'gather wood'",
+            "what happens when I gather wood?", "can you explain how to gather wood?",
+            "explain gather wood", "get advice about wood", "stop gathering wood",
+            "gather no logs", "don't follow me", "strip-mine 8 blocks unless there is lava",
+            "gather 8 logs and mine 4 blocks", "tell me to follow me", "why follow me?",
+            "Example: gather wood", "Explain: gather wood", "never, gather wood",
+            "example: follow me", "example: strip-mine 8 blocks at Y=12",
+        ]
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(local_order_plan(prompt, {}))
+
+    def test_local_gather_quantity_is_not_a_number_in_the_purpose(self):
+        self.assertEqual(explicit_wood_gather_target("gather wood for my 32 block house"), 16)
+        self.assertEqual(explicit_wood_gather_target("please gather 4 nearby oak logs"), 4)
+        for prompt in ("gather 0 logs", "gather -3 logs", "gather 1000 logs"):
+            with self.subTest(prompt=prompt), self.assertRaisesRegex(ValueError, "between 1 and 64"):
+                local_order_plan(prompt, {})
+
+    def test_local_mining_uses_explicit_or_current_level_and_rejects_invalid_targets(self):
+        result = local_order_plan("mine a tunnel 12 blocks", {"player_y_level": -40})
+        self.assertEqual(result["arguments"], {"length": 12, "y_level": -40, "direction": "player_facing"})
+        self.assertEqual(local_order_plan("strip-mine 8 blocks at Y=12", {})["arguments"]["y_level"], 12)
+        for prompt in ("strip-mine 33 blocks at Y=12", "mine 0 blocks at Y=12", "mine 8 blocks at Y=-61", "mine 8 blocks"):
+            with self.subTest(prompt=prompt), self.assertRaises(ValueError):
+                local_order_plan(prompt, {})
+
+    def test_local_router_reports_persisted_progress_and_does_not_duplicate_waiting_jobs(self):
+        context = {"current_job": {"kind": "gather_wood", "status": "waiting_for_logs", "progress": 3, "target": 8}}
+        with patch("bridge.genecraft_bridge.active_record", side_effect=AssertionError("account accessed")):
+            status = make_plan({"prompt": "what is your progress?", "context": context})
+            repeated = make_plan({"prompt": "gather 8 logs", "context": context})
+        self.assertIn("3/8", status["arguments"]["text"])
+        self.assertIn("waiting for logs", status["arguments"]["text"])
+        self.assertEqual(repeated["action"], "speak")
+        self.assertIn("active work order", repeated["arguments"]["text"])
+
+    def test_open_ended_conversation_still_uses_model(self):
+        response = {"output": [{"type": "function_call", "namespace": "minecraft", "name": "speak", "arguments": '{"text":"Let us explore the lake."}'}]}
+        with patch("bridge.genecraft_bridge.active_record", return_value={}) as account, \
+             patch("bridge.genecraft_bridge.list_models", return_value=[{"slug": "test-model"}]), \
+             patch("bridge.genecraft_bridge.choose_model", return_value="test-model"), \
+             patch("bridge.genecraft_bridge.request_response", return_value=response) as request:
+            result = make_plan({"prompt": "What should we explore together?", "context": {}})
+        account.assert_called_once()
+        request.assert_called_once()
+        self.assertEqual(result["arguments"]["text"], "Let us explore the lake.")
 
     def test_active_wood_order_is_not_duplicated_by_the_fallback(self):
         response = {"output": [{
